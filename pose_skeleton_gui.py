@@ -372,6 +372,7 @@ class App(tk.Tk):
         self.conf_var = tk.DoubleVar(value=0.4)
         self.line_var = tk.IntVar(value=3)
         self.black_var = tk.BooleanVar(value=False)
+        self.separate_var = tk.BooleanVar(value=True)
         self.preview_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="동영상을 선택하세요.")
 
@@ -420,7 +421,9 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="검은 배경에 뼈대만", variable=self.black_var
                         ).grid(row=1, column=2, columnspan=2, sticky="w", **pad)
         ttk.Checkbutton(opt, text="미리보기 (끄면 더 빠름)", variable=self.preview_var
-                        ).grid(row=1, column=4, sticky="w", **pad)
+                ).grid(row=1, column=4, sticky="w", **pad)
+        ttk.Checkbutton(opt, text="사람별 개별 포즈 추출 (정확도↑, 느림↑)",
+                variable=self.separate_var).grid(row=2, column=4, sticky="w", **pad)
 
         ttk.Label(opt, text="모델 파일(.pt)").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(opt, textvariable=self.model_path_var, width=42
@@ -511,6 +514,7 @@ class App(tk.Tk):
             input=self.in_var.get(),
             output=self.out_var.get(),
             model=model_path or MODELS[self.model_var.get()],
+            separate=bool(self.separate_var.get()),
             min_conf=float(self.conf_var.get()),
             line_w=int(self.line_var.get()),
             black=self.black_var.get(),
@@ -542,7 +546,14 @@ class App(tk.Tk):
         try:
             self._put(("status", "모델 로딩 중... (처음에는 다운로드로 시간이 걸립니다)"))
             from ultralytics import YOLO
-            model = YOLO(p["model"])
+            pose_model = YOLO(p["model"])
+            detector = None
+            if p.get("separate"):
+                # Use a lightweight person detector to split overlapping people before pose estimation
+                try:
+                    detector = YOLO("yolov8n.pt")
+                except Exception:
+                    detector = None
 
             cap = cv2.VideoCapture(p["input"])
             if not cap.isOpened():
@@ -565,17 +576,54 @@ class App(tk.Tk):
                 if not ok:
                     break
 
-                res = model.track(frame, persist=True, verbose=False)[0]
                 canvas = frame * 0 if p["black"] else frame
 
-                if res.keypoints is not None and len(res.keypoints) > 0:
-                    xy = res.keypoints.xy.cpu().numpy()
-                    cf = res.keypoints.conf.cpu().numpy()
-                    ids = (res.boxes.id.int().cpu().tolist()
-                           if res.boxes.id is not None else list(range(len(xy))))
-                    for pid, k, c in zip(ids, xy, cf):
+                if detector is not None:
+                    # Detect persons first, then run pose on each crop to separate close/overlapping people
+                    dets = detector(frame, conf=p["min_conf"], classes=[0], verbose=False)[0]
+                    boxes = []
+                    if hasattr(dets, "boxes") and dets.boxes is not None:
+                        xyxy = dets.boxes.xyxy.cpu().numpy()
+                        for b in xyxy:
+                            x1, y1, x2, y2 = [int(v) for v in b]
+                            # ensure valid box
+                            x1 = max(0, min(x1, frame.shape[1] - 1))
+                            x2 = max(0, min(x2, frame.shape[1] - 1))
+                            y1 = max(0, min(y1, frame.shape[0] - 1))
+                            y2 = max(0, min(y2, frame.shape[0] - 1))
+                            if x2 > x1 and y2 > y1:
+                                boxes.append((x1, y1, x2, y2))
+
+                    ids = list(range(len(boxes)))
+                    for pid, (x1, y1, x2, y2) in zip(ids, boxes):
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            continue
+                        try:
+                            cres = pose_model(crop, conf=p["min_conf"], verbose=False)[0]
+                        except Exception:
+                            continue
+                        if cres.keypoints is None or len(cres.keypoints) == 0:
+                            continue
+                        # take first detected pose in the crop
+                        k = cres.keypoints.xy.cpu().numpy()[0]
+                        c = cres.keypoints.conf.cpu().numpy()[0]
+                        # offset to original frame coords
+                        k[:, 0] += x1
+                        k[:, 1] += y1
                         draw_person(canvas, k, c, COLORS[pid % len(COLORS)],
                                     p["min_conf"], p["line_w"], dot_r)
+                else:
+                    # Fallback: use single pose model with tracking as before
+                    res = pose_model.track(frame, persist=True, verbose=False)[0]
+                    if res.keypoints is not None and len(res.keypoints) > 0:
+                        xy = res.keypoints.xy.cpu().numpy()
+                        cf = res.keypoints.conf.cpu().numpy()
+                        ids = (res.boxes.id.int().cpu().tolist()
+                               if res.boxes.id is not None else list(range(len(xy))))
+                        for pid, k, c in zip(ids, xy, cf):
+                            draw_person(canvas, k, c, COLORS[pid % len(COLORS)],
+                                        p["min_conf"], p["line_w"], dot_r)
 
                 writer.write(canvas)
                 n += 1
