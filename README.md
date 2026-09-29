@@ -97,3 +97,16 @@ python -m http.server 8000
 
 - 프로젝트 루트에 `maximo_tango_b.png`를 두면 `index.html` 상단 헤더에 로고가 자동 표시됩니다.
   파일이 없으면 자동으로 숨깁니다(404로 인한 빈 이미지 표시 방지).
+
+## ObjectDetector (선택)
+
+- 브라우저에서 `사람별 개별 포즈 추출` 옵션을 사용하려면 ObjectDetector 모델 파일이 필요합니다:
+  `models/object_detector.task`.
+- 이 리포에 모델 파일을 직접 추가하지 않은 경우, 제공된 스크립트로 원하는 URL에서 내려받을 수 있습니다:
+
+```bash
+python scripts/download_model.py --url https://example.com/path/to/object_detector.task
+```
+
+- 모델을 다운로드하면 `index.html`의 `사람별 개별 포즈 추출` 옵션이 로컬 모델을 사용해 바운딩박스 기반 분리 후
+  각 크롭에 대해 포즈 추론을 실행합니다. 모델을 추가하지 않으면 자동으로 기존 `PoseLandmarker.detectForVideo()` 경로를 사용합니다.
