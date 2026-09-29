@@ -155,6 +155,10 @@
       <input type="range" id="poseMax" min="128" max="1024" step="32" value="512">
     </div>
     <div class="field">
+      <div class="head"><span>포즈 재사용(ms)</span><span id="poseReuseLbl">400</span></div>
+      <input type="range" id="poseReuse" min="50" max="2000" step="50" value="400">
+    </div>
+    <div class="field">
       <div class="head"><span>최대 인식 인원</span></div>
       <select id="numPoses">
         <option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
@@ -213,7 +217,6 @@ const MAXDIM = 1280;                                 // 캔버스 최대 변 길
 let DETECT_INTERVAL_MS = 150;                      // run pose detection at most once per this many ms
 const DETECT_MAX_SIDE = 960;                         // downscale video to this side for detection
 let POSE_MAX_SIDE = 512;                           // downscale per-person crop for pose inference
-const POSE_REUSE_MS = 400;                          // reuse recent pose for stable boxes (ms)
 const COLORS = ['#22d3ee', '#4ade80', '#fb923c', '#e879f9', '#60a5fa', '#facc15'];
 // MediaPipe Pose 33점 연결
 const CONN = [
@@ -239,6 +242,14 @@ const _shared = {
   downscale: document.createElement('canvas'),
   crop: document.createElement('canvas'),
 };
+// Preproc worker (OffscreenCanvas) for downscaling frames to reduce main-thread load
+let preprocWorker = null;
+try {
+  preprocWorker = new Worker('./scripts/preproc-worker.js');
+  preprocWorker.onmessage = (ev) => {
+    // messages are handled inline where worker is used via Promise wrappers
+  };
+} catch (e) { console.debug('preproc worker unavailable', e); preprocWorker = null; }
 const rec = { active: false, recorder: null, chunks: [], start: 0, end: 0, mime: '' };
 
 // lightweight tracker state to reduce redundant per-crop pose runs
@@ -247,6 +258,18 @@ let lastDetTime = 0;
 let trackedPersons = []; // {id,bbox,lastPose,lastPoseTs}
 let _nextPersonId = 1;
 const IOU_MATCH = 0.3;
+
+// Kalman filter for bbox center smoothing (simple 1D filters per axis)
+class Kalman1D {
+  constructor(q=0.01, r=10) { this.q = q; this.r = r; this.x = 0; this.p = 1; }
+  predict() { this.p += this.q; return this.x; }
+  update(z) { const k = this.p / (this.p + this.r); this.x = this.x + k * (z - this.x); this.p = (1 - k) * this.p; return this.x; }
+}
+class SimpleKalmanBox {
+  constructor(x=0, y=0) { this.kx = new Kalman1D(); this.ky = new Kalman1D(); this.kx.x = x; this.ky.x = y; }
+  predict() { return { x: this.kx.predict(), y: this.ky.predict() }; }
+  update(x,y) { this.kx.update(x); this.ky.update(y); }
+}
 
 const opts = {
   get model() { return $('#model').value; },
@@ -279,6 +302,30 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 function loopActive() { return $('#loopChk').checked && a !== null && b !== null && b > a; }
+
+// Helper: downscale current video frame using worker if available
+async function createDownscaledBitmap(dw, dh) {
+  try {
+    const ibSrc = await createImageBitmap(video);
+    if (preprocWorker) {
+      return await new Promise((resolve, reject) => {
+        const onmsg = (ev) => {
+          const m = ev.data;
+          if (m.type === 'downscaled') { preprocWorker.removeEventListener('message', onmsg); resolve(m.ib); }
+          else if (m.type === 'error') { preprocWorker.removeEventListener('message', onmsg); reject(new Error(m.message)); }
+        };
+        preprocWorker.addEventListener('message', onmsg);
+        try { preprocWorker.postMessage({ type: 'downscale', ib: ibSrc, dw, dh }, [ibSrc]); }
+        catch (e) { preprocWorker.removeEventListener('message', onmsg); try { ibSrc.close(); } catch{}; reject(e); }
+      });
+    } else {
+      _shared.downscale.width = dw; _shared.downscale.height = dh;
+      const tctx = _shared.downscale.getContext('2d'); tctx.drawImage(video, 0, 0, dw, dh);
+      try { ibSrc.close(); } catch (e) {}
+      return await createImageBitmap(_shared.downscale);
+    }
+  } catch (e) { throw e; }
+}
 
 // ---------- 모델 로딩 ----------
 async function initLandmarker() {
@@ -483,6 +530,17 @@ $('#clearAB').addEventListener('click', () => { a = b = null; refreshAB(); });
 $('#minVis').addEventListener('input', (e) => { $('#visLbl').textContent = parseFloat(e.target.value).toFixed(2); });
 $('#lineW').addEventListener('input', (e) => { $('#lwLbl').textContent = e.target.value; });
 $('#sound').addEventListener('change', (e) => { video.muted = !e.target.checked; });
+// Persist and handle detect/pose sliders
+const savedDetect = parseInt(localStorage.getItem('detectInterval'), 10);
+if (!Number.isNaN(savedDetect)) { DETECT_INTERVAL_MS = savedDetect; $('#detectInterval').value = savedDetect; $('#detectLbl').textContent = savedDetect + 'ms'; }
+const savedPoseMax = parseInt(localStorage.getItem('poseMaxSide'), 10);
+if (!Number.isNaN(savedPoseMax)) { POSE_MAX_SIDE = savedPoseMax; $('#poseMax').value = savedPoseMax; $('#poseMaxLbl').textContent = String(savedPoseMax); }
+const savedPoseReuse = parseInt(localStorage.getItem('poseReuseMs'), 10);
+if (!Number.isNaN(savedPoseReuse)) { POSE_REUSE_MS = savedPoseReuse; $('#poseReuse').value = savedPoseReuse; $('#poseReuseLbl').textContent = String(savedPoseReuse); }
+$('#detectInterval').addEventListener('input', (e) => { DETECT_INTERVAL_MS = parseInt(e.target.value, 10); $('#detectLbl').textContent = DETECT_INTERVAL_MS + 'ms'; localStorage.setItem('detectInterval', String(DETECT_INTERVAL_MS)); });
+$('#poseMax').addEventListener('input', (e) => { POSE_MAX_SIDE = parseInt(e.target.value, 10); $('#poseMaxLbl').textContent = String(POSE_MAX_SIDE); localStorage.setItem('poseMaxSide', String(POSE_MAX_SIDE)); });
+let POSE_REUSE_MS = 400;
+$('#poseReuse').addEventListener('input', (e) => { POSE_REUSE_MS = parseInt(e.target.value, 10); $('#poseReuseLbl').textContent = String(POSE_REUSE_MS); localStorage.setItem('poseReuseMs', String(POSE_REUSE_MS)); });
 
 // ---------- 그리기 ----------
 function sizeCanvas() {
@@ -556,19 +614,19 @@ function loop() {
       // Try faster path: create a small ImageBitmap and run image detection if supported by API
       let detected = false;
       try {
-        // prepare downscaled canvas
+        // prepare downscaled canvas (use worker if available)
         const vw = video.videoWidth, vh = video.videoHeight;
         const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(vw || 1, vh || 1));
-          if (scale < 1) {
+        if (scale < 1) {
           const dw = Math.round(vw * scale), dh = Math.round(vh * scale);
-          _shared.downscale.width = dw; _shared.downscale.height = dh;
-          const tctx = _shared.downscale.getContext('2d'); tctx.drawImage(video, 0, 0, dw, dh);
-          const ib = await createImageBitmap(_shared.downscale);
-          if (landmarker.detect) {
-            const r = landmarker.detect(ib);
-            if (r) { result = r; detected = true; }
-          }
-          ib.close();
+          try {
+            const ib = await createDownscaledBitmap(dw, dh);
+            if (landmarker.detect) {
+              const r = landmarker.detect(ib);
+              if (r) { result = r; detected = true; }
+            }
+            try { ib.close && ib.close(); } catch (e) {}
+          } catch (e) { console.debug('fast detect worker path failed', e); }
         }
       } catch (err) {
         // gracefully fallback to detectForVideo
@@ -610,13 +668,31 @@ function loop() {
               return null;
             }).filter(Boolean);
 
-            // match to tracked persons
+            // match to tracked persons (use Kalman predicted centers when available)
             const newTracked = [];
+            const preds = trackedPersons.map(p => {
+              const pc = p.kbox ? p.kbox.predict() : { x: p.bbox.x1 + p.bbox.w/2, y: p.bbox.y1 + p.bbox.h/2 };
+              return { p, pc };
+            });
             for (const b of boxes) {
               let matched = null, best = 0;
-              for (const p of trackedPersons) { const s = iou(p.bbox,b); if (s>best) { best=s; matched=p; } }
-              if (matched && best >= IOU_MATCH) { matched.bbox = b; matched.lastSeen = now; newTracked.push(matched); }
-              else { const id = _nextPersonId++; newTracked.push({ id, bbox: b, lastPose: null, lastPoseTs: 0, lastSeen: now }); }
+              for (const { p, pc } of preds) {
+                const predBox = { x1: pc.x - p.bbox.w/2, y1: pc.y - p.bbox.h/2, w: p.bbox.w, h: p.bbox.h };
+                const s = iou(predBox, b);
+                if (s > best) { best = s; matched = p; }
+              }
+              if (matched && best >= IOU_MATCH) {
+                matched.bbox = b; matched.lastSeen = now;
+                // update Kalman with new center measurement
+                try {
+                  if (matched.kbox) matched.kbox.update(b.x1 + b.w/2, b.y1 + b.h/2);
+                } catch (e) {}
+                newTracked.push(matched);
+              } else {
+                const id = _nextPersonId++;
+                const centerX = b.x1 + b.w/2, centerY = b.y1 + b.h/2;
+                newTracked.push({ id, bbox: b, lastPose: null, lastPoseTs: 0, lastSeen: now, kbox: new SimpleKalmanBox(centerX, centerY) });
+              }
             }
             trackedPersons = newTracked;
 
