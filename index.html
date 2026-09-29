@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<!-- 영상·데이터가 외부로 나가지 못하도록 네트워크 연결을 같은 사이트로 제한합니다.
+     (MediaPipe 라이브러리가 기본으로 시도하는 사용 통계 전송도 함께 차단됩니다.) -->
+<meta http-equiv="Content-Security-Policy" content="connect-src 'self' blob: data:">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>동영상 관절 스켈레톤</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e8ee;
+    --muted: #98a0b3; --accent: #3b82f6; --warn: #fbbf24; --err: #f87171; --ok: #34d399;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 17px; }
+  header span { color: var(--muted); font-size: 12.5px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; padding: 16px 20px 28px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 920px) { main { grid-template-columns: 1fr; } }
+
+  .screen { position: relative; background: #000; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 240px; }
+  #cv { display: block; max-width: 100%; max-height: 70vh; width: auto; height: auto; }
+  .drop { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; text-align: center; color: var(--muted); padding: 20px; border: 2px dashed var(--line); border-radius: 10px; margin: 10px; }
+  .drop[hidden] { display: none; }
+  .drop.over { border-color: var(--accent); color: var(--text); }
+  .badge { position: absolute; left: 10px; top: 10px; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+    background: rgba(0,0,0,.65); border: 1px solid var(--line); max-width: calc(100% - 20px); }
+  .badge.busy { color: var(--warn); } .badge.ok { color: var(--ok); } .badge.err { color: var(--err); white-space: normal; }
+  .stats { position: absolute; right: 10px; top: 10px; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+    background: rgba(0,0,0,.65); border: 1px solid var(--line); color: var(--muted); }
+
+  .tl { position: relative; height: 34px; margin-top: 10px; background: #1b1f28; border: 1px solid var(--line);
+    border-radius: 8px; cursor: pointer; touch-action: none; user-select: none; }
+  .tl-track { position: absolute; left: 8px; right: 8px; top: 15px; height: 4px; background: #3a4150; border-radius: 2px; }
+  .tl-inner { position: absolute; left: 8px; right: 8px; top: 0; bottom: 0; }
+  .tl-range { position: absolute; top: 12px; height: 10px; background: var(--accent); opacity: .85; border-radius: 3px; display: none; }
+  .tl-mark { position: absolute; top: 2px; bottom: 2px; width: 2px; background: var(--warn); display: none; }
+  .tl-mark span { position: absolute; top: -1px; left: 4px; font-size: 10px; font-weight: 700; color: var(--warn); }
+  .tl-head { position: absolute; top: 3px; bottom: 3px; width: 2px; background: #fff; }
+  .tl-head::after { content: ""; position: absolute; left: -4px; top: 11px; width: 10px; height: 10px; border-radius: 50%; background: #fff; }
+
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .row .grow { flex: 1; }
+  .time { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 210px; text-align: right; }
+  button, select, input[type=number] { font: inherit; color: var(--text); background: #222733; border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 12px; }
+  button { cursor: pointer; } button:hover:not(:disabled) { background: #2b3242; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #2f6fe0; }
+  button.danger { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+  button.mini { padding: 4px 8px; font-size: 12.5px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input[type=range] { accent-color: var(--accent); }
+  .lbl { color: var(--muted); font-size: 12.5px; }
+  .ab { color: var(--muted); font-size: 12.5px; }
+
+  aside { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; align-self: start; }
+  aside h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+  .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .field .head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); }
+  .field select { width: 100%; }
+  .chk { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .hr { height: 1px; background: var(--line); margin: 12px 0; }
+  .btns { display: flex; flex-direction: column; gap: 8px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .keys { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.7; }
+  kbd { background: #222733; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; font-size: 11.5px; }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #222733; border: 1px solid var(--line);
+    padding: 8px 16px; border-radius: 8px; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 10; max-width: 90vw; }
+  #toast.show { opacity: 1; }
+  #v { position: fixed; left: -9999px; top: 0; width: 2px; height: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>동영상 관절 스켈레톤</h1>
+  <span>영상은 서버로 업로드되지 않고 이 브라우저 안에서만 처리됩니다.</span>
+</header>
+
+<main>
+  <section>
+    <div class="screen" id="screen">
+      <canvas id="cv" width="960" height="540"></canvas>
+      <div class="drop" id="drop">
+        <div style="font-size:15px;color:var(--text)">동영상을 여기로 끌어다 놓으세요</div>
+        <div>또는</div>
+        <button class="primary" id="openBtn">동영상 열기</button>
+      </div>
+      <div class="badge busy" id="badge">모델 로딩 중…</div>
+      <div class="stats" id="stats" hidden></div>
+    </div>
+
+    <div class="tl" id="tl" title="클릭 또는 드래그로 이동">
+      <div class="tl-track"></div>
+      <div class="tl-inner" id="tlInner">
+        <div class="tl-range" id="tlRange"></div>
+        <div class="tl-mark" id="mA"><span>A</span></div>
+        <div class="tl-mark" id="mB"><span>B</span></div>
+        <div class="tl-head" id="tlHead" style="left:0"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="toStart" title="처음(또는 A 지점)으로">⏮</button>
+      <button id="stepBack" title="1프레임 뒤로 (←)">◀|</button>
+      <button id="playBtn" class="primary" style="min-width:110px">▶ 재생</button>
+      <button id="stepFwd" title="1프레임 앞으로 (→)">|▶</button>
+      <span class="grow"></span>
+      <span class="time" id="timeEl">00:00.00 / 00:00.00</span>
+    </div>
+
+    <div class="row">
+      <span class="lbl">재생 속도</span>
+      <input type="range" id="speed" min="0.1" max="3" step="0.05" value="1" style="width:200px">
+      <span id="speedLbl" style="width:48px">1.00x</span>
+      <button class="mini" data-speed="0.25">0.25x</button>
+      <button class="mini" data-speed="0.5">0.5x</button>
+      <button class="mini" data-speed="1">1x</button>
+      <button class="mini" data-speed="1.5">1.5x</button>
+      <button class="mini" data-speed="2">2x</button>
+    </div>
+
+    <div class="row">
+      <button id="setA">A 지정</button>
+      <button id="setB">B 지정</button>
+      <button id="clearAB">구간 해제</button>
+      <label class="chk" style="margin:0 0 0 8px"><input type="checkbox" id="loopChk" checked> 구간 반복</label>
+      <span class="ab" id="abLbl">구간: 지정 안 됨</span>
+    </div>
+  </section>
+
+  <aside>
+    <h2>인식 설정</h2>
+    <div class="field">
+      <div class="head"><span>모델</span></div>
+      <select id="model">
+        <option value="lite">Lite — 가장 빠름 (5.8MB)</option>
+        <option value="full" selected>Full — 균형 (9.4MB)</option>
+        <option value="heavy">Heavy — 가장 정확 (30MB)</option>
+      </select>
+    </div>
+    <div class="field">
+      <div class="head"><span>최대 인식 인원</span></div>
+      <select id="numPoses">
+        <option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
+      </select>
+    </div>
+    <div class="field">
+      <div class="head"><span>연산 장치</span></div>
+      <select id="delegate">
+        <option value="GPU" selected>GPU (실패하면 CPU로 자동 전환)</option>
+        <option value="CPU">CPU</option>
+      </select>
+    </div>
+
+    <div class="hr"></div>
+    <h2>표시 설정</h2>
+    <div class="field">
+      <div class="head"><span>관절 표시 신뢰도</span><span id="visLbl">0.50</span></div>
+      <input type="range" id="minVis" min="0" max="0.95" step="0.05" value="0.5">
+    </div>
+    <div class="field">
+      <div class="head"><span>선 굵기</span><span id="lwLbl">3</span></div>
+      <input type="range" id="lineW" min="1" max="10" step="1" value="3">
+    </div>
+    <label class="chk"><input type="checkbox" id="showSk" checked> 뼈대 표시</label>
+    <label class="chk"><input type="checkbox" id="black"> 검은 배경에 뼈대만</label>
+    <label class="chk"><input type="checkbox" id="hideFace" checked> 얼굴 세부점 숨기기 (코만 표시)</label>
+    <label class="chk"><input type="checkbox" id="sound"> 소리 켜기</label>
+
+    <div class="hr"></div>
+    <div class="btns">
+      <button id="snapBtn">현재 화면 PNG 저장</button>
+      <button id="recBtn">뼈대 영상 녹화 · 저장</button>
+    </div>
+    <div class="note">녹화는 현재 재생 속도로 실시간 진행됩니다. 구간 반복이 켜져 있고 A·B가 지정돼 있으면 그 구간만 저장합니다. 녹화 중에는 이 탭을 벗어나지 마세요. 저장 파일에는 소리가 들어가지 않습니다.</div>
+    <div class="keys">
+      <kbd>Space</kbd> 재생/정지 · <kbd>←</kbd><kbd>→</kbd> 프레임 이동<br>
+      <kbd>A</kbd> <kbd>B</kbd> 구간 지정 · <kbd>L</kbd> 구간 반복 켜기/끄기
+    </div>
+  </aside>
+</main>
+
+<video id="v" playsinline muted preload="auto"></video>
+<div id="toast"></div>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "./vendor/vision_bundle.mjs";
+
+const $ = (s) => document.querySelector(s);
+const video = $('#v'), cv = $('#cv'), ctx = cv.getContext('2d');
+const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+
+// ---------- 상수 ----------
+const MAXDIM = 1280;                                 // 캔버스 최대 변 길이(성능/녹화 용량)
+const COLORS = ['#22d3ee', '#4ade80', '#fb923c', '#e879f9', '#60a5fa', '#facc15'];
+// MediaPipe Pose 33점 연결
+const CONN = [
+  [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
+  [11,12],[11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
+  [12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
+  [11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],
+  [27,29],[28,30],[29,31],[30,32],[27,31],[28,32]
+];
+const HAS_RVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+// ---------- 상태 ----------
+let landmarker = null, fileset = null, loadToken = 0;
+let hasVideo = false, objUrl = null, baseName = 'video';
+let result = null, frameReady = false, forceDetect = false, lastDetectT = -1, lastTs = 0;
+let a = null, b = null;
+let fps = 30, prevMT = null, minD = Infinity;
+let inferMs = 0, dragging = false;
+const rec = { active: false, recorder: null, chunks: [], start: 0, end: 0, mime: '' };
+
+const opts = {
+  get model() { return $('#model').value; },
+  get numPoses() { return parseInt($('#numPoses').value, 10); },
+  get delegate() { return $('#delegate').value; },
+  get minVis() { return parseFloat($('#minVis').value); },
+  get lineW() { return parseInt($('#lineW').value, 10); },
+  get show() { return $('#showSk').checked; },
+  get black() { return $('#black').checked; },
+  get hideFace() { return $('#hideFace').checked; },
+};
+
+// ---------- 유틸 ----------
+function fmt(t) {
+  t = Math.max(0, t || 0);
+  const m = Math.floor(t / 60);
+  return String(m).padStart(2, '0') + ':' + (t - m * 60).toFixed(2).padStart(5, '0');
+}
+let toastTimer = null;
+function toast(msg) {
+  const el = $('#toast'); el.textContent = msg; el.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+function setBadge(text, cls) { const el = $('#badge'); el.textContent = text; el.className = 'badge ' + cls; }
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+function loopActive() { return $('#loopChk').checked && a !== null && b !== null && b > a; }
+
+// ---------- 모델 로딩 ----------
+async function initLandmarker() {
+  const token = ++loadToken;
+  setBadge('모델 로딩 중…', 'busy');
+  if (location.protocol === 'file:') {
+    setBadge('index.html을 더블클릭으로 열면 동작하지 않습니다. GitHub Pages나 로컬 서버(python -m http.server)로 여세요.', 'err');
+    return;
+  }
+  try {
+    fileset ??= await FilesetResolver.forVisionTasks(new URL('./vendor/wasm', location.href).href);
+    const make = (delegate) => PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: new URL(`./models/pose_landmarker_${opts.model}.task`, location.href).href,
+        delegate,
+      },
+      runningMode: 'VIDEO',
+      numPoses: opts.numPoses,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    let lm, used = opts.delegate;
+    try { lm = await make(used); }
+    catch (e) {
+      if (used !== 'GPU') throw e;
+      console.warn('GPU 초기화 실패, CPU로 전환합니다.', e);
+      used = 'CPU'; $('#delegate').value = 'CPU';
+      lm = await make('CPU');
+    }
+    if (token !== loadToken) { lm.close(); return; }     // 그 사이 설정이 또 바뀜
+    const old = landmarker; landmarker = lm; old?.close();
+    result = null; forceDetect = true;
+    setBadge(`준비 완료 · ${used}`, 'ok');
+  } catch (e) {
+    console.error(e);
+    if (token === loadToken) setBadge('모델 로딩 실패: ' + (e.message || e), 'err');
+  }
+}
+
+// ---------- 동영상 열기 ----------
+function openFile(file) {
+  if (!file) return;
+  if (!file.type.startsWith('video/')) { toast('동영상 파일만 열 수 있습니다.'); return; }
+  if (rec.active) stopRecording();
+  if (objUrl) URL.revokeObjectURL(objUrl);
+  objUrl = URL.createObjectURL(file);
+  baseName = file.name.replace(/\.[^.]+$/, '');
+  hasVideo = false; result = null; a = b = null; refreshAB();
+  prevMT = null; minD = Infinity; fps = 30;
+  video.src = objUrl;
+  video.playbackRate = video.defaultPlaybackRate = parseFloat($('#speed').value);
+  video.load();
+}
+video.addEventListener('loadeddata', () => {
+  hasVideo = true; $('#drop').hidden = true; forceDetect = true; lastDetectT = -1;
+  updatePlayBtn();
+});
+video.addEventListener('error', () => {
+  hasVideo = false; $('#drop').hidden = false;
+  toast('이 브라우저에서 재생할 수 없는 형식입니다. (mp4/H.264 또는 webm을 권장)');
+});
+video.addEventListener('seeked', () => { forceDetect = true; });
+video.addEventListener('play', updatePlayBtn);
+video.addEventListener('pause', updatePlayBtn);
+video.addEventListener('ended', () => {
+  if (rec.active) { stopRecording(); return; }
+  if (loopActive()) { video.currentTime = a; video.play().catch(() => {}); }
+  updatePlayBtn();
+});
+
+$('#openBtn').addEventListener('click', () => {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'video/*';
+  inp.onchange = () => openFile(inp.files[0]);
+  inp.click();
+});
+window.addEventListener('dragover', (e) => { e.preventDefault(); $('#drop').classList.add('over'); });
+window.addEventListener('dragleave', () => $('#drop').classList.remove('over'));
+window.addEventListener('drop', (e) => {
+  e.preventDefault(); $('#drop').classList.remove('over');
+  openFile(e.dataTransfer.files[0]);
+});
+
+// ---------- 재생 제어 ----------
+function updatePlayBtn() {
+  $('#playBtn').textContent = (hasVideo && !video.paused && !video.ended) ? '⏸ 일시정지' : '▶ 재생';
+}
+function seek(t) {
+  if (!hasVideo || rec.active) return;
+  video.currentTime = clamp(t, 0, video.duration || 0);
+}
+function togglePlay() {
+  if (!hasVideo || rec.active) return;
+  if (video.paused || video.ended) {
+    const t = video.currentTime;
+    if (loopActive()) { if (t < a || t >= b) video.currentTime = a; }
+    else if (video.ended || t >= video.duration - 0.05) video.currentTime = 0;
+    video.play().catch(() => {});
+  } else video.pause();
+}
+function step(dir) {
+  if (!hasVideo || rec.active) return;
+  video.pause();
+  const n = Math.floor(video.currentTime * fps + 1e-6);
+  seek((n + dir + 0.5) / fps);                          // 프레임 중앙을 겨냥
+}
+$('#playBtn').addEventListener('click', togglePlay);
+$('#stepBack').addEventListener('click', () => step(-1));
+$('#stepFwd').addEventListener('click', () => step(1));
+$('#toStart').addEventListener('click', () => seek(a ?? 0));
+
+// 속도
+function setSpeed(v) {
+  v = clamp(Math.round(v / 0.05) * 0.05, 0.1, 3);
+  $('#speed').value = v; $('#speedLbl').textContent = v.toFixed(2) + 'x';
+  video.playbackRate = video.defaultPlaybackRate = v;
+}
+$('#speed').addEventListener('input', (e) => setSpeed(parseFloat(e.target.value)));
+document.querySelectorAll('[data-speed]').forEach((btn) =>
+  btn.addEventListener('click', () => setSpeed(parseFloat(btn.dataset.speed))));
+
+// 타임라인
+const tl = $('#tl'), tlInner = $('#tlInner');
+function seekFromEvent(e) {
+  const r = tlInner.getBoundingClientRect();
+  seek(clamp((e.clientX - r.left) / r.width, 0, 1) * (video.duration || 0));
+}
+tl.addEventListener('pointerdown', (e) => {
+  if (!hasVideo || rec.active) return;
+  dragging = true; tl.setPointerCapture(e.pointerId); seekFromEvent(e);
+});
+tl.addEventListener('pointermove', (e) => { if (dragging) seekFromEvent(e); });
+tl.addEventListener('pointerup', () => { dragging = false; });
+tl.addEventListener('pointercancel', () => { dragging = false; });
+
+// A-B 구간
+function setA() {
+  if (!hasVideo) return;
+  a = video.currentTime; if (b !== null && b <= a) b = null; refreshAB();
+}
+function setB() {
+  if (!hasVideo) return;
+  const t = video.currentTime;
+  if (a !== null && t <= a) { toast('B는 A보다 뒤 위치여야 합니다.'); return; }
+  b = t; if (a === null) a = 0; refreshAB();
+}
+function refreshAB() {
+  const dur = video.duration || 1;
+  const pos = (t) => (clamp(t / dur, 0, 1) * 100) + '%';
+  const mA = $('#mA'), mB = $('#mB'), range = $('#tlRange');
+  mA.style.display = a !== null ? 'block' : 'none'; if (a !== null) mA.style.left = pos(a);
+  mB.style.display = b !== null ? 'block' : 'none'; if (b !== null) mB.style.left = pos(b);
+  if (a !== null && b !== null) {
+    range.style.display = 'block'; range.style.left = pos(a);
+    range.style.width = (clamp((b - a) / dur, 0, 1) * 100) + '%';
+  } else range.style.display = 'none';
+  $('#abLbl').textContent = (a === null && b === null) ? '구간: 지정 안 됨'
+    : `구간  A ${a !== null ? fmt(a) : '--'}  ~  B ${b !== null ? fmt(b) : '--'}`;
+}
+$('#setA').addEventListener('click', setA);
+$('#setB').addEventListener('click', setB);
+$('#clearAB').addEventListener('click', () => { a = b = null; refreshAB(); });
+
+// ---------- 옵션 ----------
+['model', 'numPoses', 'delegate'].forEach((id) => $('#' + id).addEventListener('change', initLandmarker));
+$('#minVis').addEventListener('input', (e) => { $('#visLbl').textContent = parseFloat(e.target.value).toFixed(2); });
+$('#lineW').addEventListener('input', (e) => { $('#lwLbl').textContent = e.target.value; });
+$('#sound').addEventListener('change', (e) => { video.muted = !e.target.checked; });
+
+// ---------- 그리기 ----------
+function sizeCanvas() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return false;
+  const k = Math.min(1, MAXDIM / Math.max(vw, vh));
+  const w = Math.round(vw * k), h = Math.round(vh * k);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  return true;
+}
+function drawPerson(lm, color, W, H, lw) {
+  const ok = (i) => (lm[i].visibility ?? 1) >= opts.minVis;
+  const hide = opts.hideFace;
+  ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.strokeStyle = color;
+  ctx.beginPath();
+  for (const [i, j] of CONN) {
+    if (hide && i <= 10 && j <= 10) continue;
+    if (!ok(i) || !ok(j)) continue;
+    ctx.moveTo(lm[i].x * W, lm[i].y * H); ctx.lineTo(lm[j].x * W, lm[j].y * H);
+  }
+  if (hide && ok(0) && ok(11) && ok(12)) {               // 코 → 어깨 중앙(목선)
+    ctx.moveTo(lm[0].x * W, lm[0].y * H);
+    ctx.lineTo((lm[11].x + lm[12].x) / 2 * W, (lm[11].y + lm[12].y) / 2 * H);
+  }
+  ctx.stroke();
+  const r = lw * 1.7;
+  ctx.lineWidth = Math.max(1.5, lw * 0.7);
+  for (let i = 0; i < lm.length; i++) {
+    if (hide && i >= 1 && i <= 10) continue;
+    if (!ok(i)) continue;
+    ctx.beginPath(); ctx.arc(lm[i].x * W, lm[i].y * H, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = color; ctx.stroke();
+  }
+}
+function draw() {
+  const W = cv.width, H = cv.height;
+  if (opts.black) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); }
+  else ctx.drawImage(video, 0, 0, W, H);
+  if (!opts.show || !result) return;
+  const lw = Math.max(1, opts.lineW * W / 960);
+  result.landmarks.forEach((lm, i) => drawPerson(lm, COLORS[i % COLORS.length], W, H, lw));
+}
+
+// ---------- 메인 루프 ----------
+if (HAS_RVFC) {
+  const onFrame = (now, meta) => {
+    frameReady = true;
+    if (prevMT !== null) {
+      const d = meta.mediaTime - prevMT;
+      if (d > 0.004 && d < 0.2) minD = Math.min(minD, d);
+    }
+    prevMT = meta.mediaTime;
+    if (minD < Infinity) fps = clamp(1 / minD, 1, 120);
+    video.requestVideoFrameCallback(onFrame);
+  };
+  video.requestVideoFrameCallback(onFrame);
+}
+let lastTimeStr = '', lastStats = 0;
+function loop() {
+  requestAnimationFrame(loop);
+  if (!hasVideo || video.readyState < 2 || !sizeCanvas()) return;
+
+  const t = video.currentTime;
+  const isNew = HAS_RVFC ? frameReady : (t !== lastDetectT);
+  if ((isNew || forceDetect) && !video.seeking && landmarker) {
+    lastTs = Math.max(lastTs + 1, performance.now());     // VIDEO 모드는 단조 증가 타임스탬프가 필요
+    const t0 = performance.now();
+    try { result = landmarker.detectForVideo(video, lastTs); }
+    catch (e) { console.warn('detect 실패', e); }
+    inferMs = inferMs * 0.8 + (performance.now() - t0) * 0.2;
+    frameReady = false; forceDetect = false; lastDetectT = t;
+  }
+  draw();
+
+  // 타임라인/시간 표시
+  const dur = video.duration || 0;
+  $('#tlHead').style.left = (dur ? clamp(t / dur, 0, 1) * 100 : 0) + '%';
+  const ts = `${fmt(t)} / ${fmt(dur)}`;
+  if (ts !== lastTimeStr) { $('#timeEl').textContent = ts; lastTimeStr = ts; }
+
+  const now = performance.now();
+  if (now - lastStats > 400) {
+    lastStats = now;
+    const el = $('#stats');
+    el.hidden = !landmarker;
+    el.textContent = `추론 ${inferMs.toFixed(0)}ms · ${result ? result.landmarks.length : 0}명`;
+  }
+
+  // 구간 반복 / 녹화 종료
+  if (rec.active) {
+    const p = clamp((t - rec.start) / Math.max(0.01, rec.end - rec.start), 0, 1);
+    $('#recBtn').textContent = `녹화 중… ${Math.round(p * 100)}% (클릭하면 중지)`;
+    if (t >= rec.end - 0.02 || video.ended) stopRecording();
+  } else if (loopActive() && !video.paused && t >= b) {
+    video.currentTime = a;
+  }
+}
+requestAnimationFrame(loop);
+
+// ---------- 저장 ----------
+$('#snapBtn').addEventListener('click', () => {
+  if (!hasVideo) { toast('먼저 동영상을 여세요.'); return; }
+  cv.toBlob((blob) => blob && download(blob, `${baseName}_${fmt(video.currentTime).replace(':', 'm')}s.png`), 'image/png');
+});
+
+function seekAsync(t) {
+  return new Promise((resolve) => {
+    const done = () => { video.removeEventListener('seeked', done); resolve(); };
+    video.addEventListener('seeked', done);
+    video.currentTime = t;
+  });
+}
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+
+async function startRecording() {
+  if (!hasVideo) { toast('먼저 동영상을 여세요.'); return; }
+  if (typeof MediaRecorder === 'undefined' || !cv.captureStream) { toast('이 브라우저는 녹화를 지원하지 않습니다.'); return; }
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+    .find((m) => MediaRecorder.isTypeSupported(m));
+  if (!mime) { toast('지원되는 녹화 형식을 찾지 못했습니다.'); return; }
+
+  const useRange = loopActive();
+  rec.start = useRange ? a : 0;
+  rec.end = useRange ? b : video.duration;
+  rec.mime = mime;
+  video.pause();
+  await seekAsync(rec.start);
+  forceDetect = true;
+  await nextFrame(); await nextFrame();                  // 시작 프레임이 캔버스에 그려질 때까지
+
+  rec.chunks = [];
+  rec.recorder = new MediaRecorder(cv.captureStream(30), { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+  rec.recorder.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+  rec.recorder.onstop = () => {
+    const blob = new Blob(rec.chunks, { type: mime.split(';')[0] });
+    download(blob, `${baseName}_skeleton.${mime.includes('mp4') ? 'mp4' : 'webm'}`);
+    toast('녹화 파일을 저장했습니다.');
+  };
+  rec.active = true;
+  $('#recBtn').classList.add('danger');
+  rec.recorder.start(250);
+  try { await video.play(); } catch (e) { stopRecording(); toast('재생을 시작하지 못했습니다.'); }
+}
+function stopRecording() {
+  if (!rec.active) return;
+  rec.active = false;
+  try { if (rec.recorder && rec.recorder.state !== 'inactive') rec.recorder.stop(); } catch (e) { console.warn(e); }
+  video.pause();
+  $('#recBtn').classList.remove('danger');
+  $('#recBtn').textContent = '뼈대 영상 녹화 · 저장';
+}
+$('#recBtn').addEventListener('click', () => (rec.active ? stopRecording() : startRecording()));
+
+// ---------- 단축키 ----------
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target.matches('select, textarea, input[type=text], input[type=number]')) return;
+  switch (e.code) {
+    case 'Space': e.preventDefault(); togglePlay(); break;
+    case 'ArrowLeft': e.preventDefault(); step(-1); break;
+    case 'ArrowRight': e.preventDefault(); step(1); break;
+    case 'KeyA': setA(); break;
+    case 'KeyB': setB(); break;
+    case 'KeyL': $('#loopChk').checked = !$('#loopChk').checked; break;
+  }
+});
+// 버튼 클릭 후 포커스를 풀어 Space 키가 버튼을 다시 누르지 않게 함
+document.addEventListener('click', (e) => { const btn = e.target.closest('button'); if (btn) btn.blur(); });
+
+// 디버깅/테스트용
+window.app = { get result() { return result; }, set result(v) { result = v; }, video, cv, rec };
+
+initLandmarker();
+</script>
+</body>
+</html>
