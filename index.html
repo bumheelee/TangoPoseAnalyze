@@ -295,20 +295,31 @@ async function initLandmarker() {
     setBadge(`준비 완료 · ${used}`, 'ok');
     // try to create object detector model if available and user enabled separate mode
     try {
-      const detPath = new URL('./models/object_detector.task', location.href).href;
+      // try .task first, then .tflite
+      const detTaskPath = new URL('./models/object_detector.task', location.href).href;
+      const detTflitePath = new URL('./models/object_detector.tflite', location.href).href;
       // attempt to create detector (may fail if file missing)
       if (opts.separate) {
+        const makeDetFor = (path, d) => ObjectDetector.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: path, delegate: d },
+          runningMode: 'VIDEO',
+          scoreThreshold: 0.35,
+          maxResults: 6,
+        });
+        let detUsed = opts.delegate;
         try {
-          const makeDet = (d) => ObjectDetector.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: detPath, delegate: d },
-            runningMode: 'VIDEO',
-            scoreThreshold: 0.35,
-            maxResults: 6,
-          });
-          let detUsed = opts.delegate;
-          try { detector = await makeDet(detUsed); }
-          catch (e) {
-            if (detUsed === 'GPU') { detUsed = 'CPU'; $('#delegate').value = 'CPU'; detector = await makeDet(detUsed); }
+          // try task
+          try { detector = await makeDetFor(detTaskPath, detUsed); }
+          catch (errTask) {
+            // task failed, try tflite
+            try { detector = await makeDetFor(detTflitePath, detUsed); }
+            catch (errT) {
+              if (detUsed === 'GPU') {
+                detUsed = 'CPU'; $('#delegate').value = 'CPU';
+                try { detector = await makeDetFor(detTaskPath, detUsed); }
+                catch (e2) { detector = await makeDetFor(detTflitePath, detUsed); }
+              } else throw errT;
+            }
           }
           haveDetectorModel = !!detector;
         } catch (e) { console.debug('object detector not available', e); detector = null; haveDetectorModel = false; }
