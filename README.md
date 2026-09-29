@@ -12,14 +12,15 @@
 
 1. 이 폴더의 **모든 파일**(숨김 파일 `.nojekyll` 포함)을 GitHub 저장소에 올립니다.
    - `git push`로 올리면 그대로 됩니다. (파일당 100MB 미만이라 Git LFS는 필요 없습니다.)
-   - GitHub 웹 화면에서 끌어다 놓는 방식은 **파일당 25MB 제한**이 있어 `heavy` 모델(약 30MB)이 올라가지 않습니다.
-     웹으로 올릴 거라면 아래 안내대로 heavy 모델을 먼저 지우세요.
+   - GitHub 웹 화면에서 끌어다 놓는 방식은 **파일당 25MB 제한**이 있어 대형 모델은 업로드에 제약이 있습니다.
+    이 저장소는 GitHub 업로드 제한을 고려해 `pose_landmarker_heavy.task`를 기본으로 포함하지 않습니다.
+    필요하면 직접 내려받아 `models/`에 넣으세요.
 2. 저장소 **Settings → Pages → Build and deployment**에서 Source를 `Deploy from a branch`,
    Branch를 `main` / `/ (root)`로 지정하고 저장합니다.
 3. 1~2분 뒤 `https://<계정>.github.io/<저장소>/` 로 접속합니다.
 
-> 용량을 줄이고 싶으면 `models/pose_landmarker_heavy.task`(30MB)를 삭제하고
-> `index.html`의 `<option value="heavy">` 줄도 함께 지우세요.
+> 이 저장소는 업로드 한도를 고려해 `pose_landmarker_heavy.task`를 기본적으로 포함하지 않습니다.
+> 필요하면 공식 배포처에서 모델을 내려받아 `models/`에 추가하세요.
 
 ## 내 PC에서 먼저 확인하기
 
@@ -58,7 +59,7 @@ python -m http.server 8000
 | 경로 | 내용 | 라이선스 |
 |---|---|---|
 | `vendor/vision_bundle.mjs`, `vendor/wasm/*` | [@mediapipe/tasks-vision](https://www.npmjs.com/package/@mediapipe/tasks-vision) 1.0.1 (수정 없음) | Apache-2.0 |
-| `models/pose_landmarker_{lite,full,heavy}.task` | Google MediaPipe Pose Landmarker 모델 | Apache-2.0 |
+| `models/pose_landmarker_{lite,full}.task` | Google MediaPipe Pose Landmarker 모델 | Apache-2.0 |
 
 모델 파일은 공식 배포 주소(`storage.googleapis.com/mediapipe-models/pose_landmarker/…`)가 아니라,
 같은 모델을 담고 있는 npm 패키지에서 꺼내 왔습니다. 공식 파일과 같은지 확인하려면 SHA-256을 비교하세요.
@@ -66,7 +67,7 @@ python -m http.server 8000
 ```
 59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a  pose_landmarker_lite.task
 4eaa5eb7a98365221087693fcc286334cf0858e2eb6e15b506aa4a7ecdcec4ad  pose_landmarker_full.task
-64437af838a65d18e5ba7a0d39b465540069bc8aae8308de3e318aad31fcbc7b  pose_landmarker_heavy.task
+ 
 ```
 
 공식 주소에서 직접 받아 교체해도 됩니다.

@@ -82,7 +82,7 @@
 <header>
   <h1>동영상 관절 스켈레톤</h1>
   <span>영상은 서버로 업로드되지 않고 이 브라우저 안에서만 처리됩니다.</span>
-  <img id="logoImg" src="maximo_tango_b.png" alt="logo" style="height:36px;margin-left:12px;object-fit:contain" onerror="this.style.display='none'">
+  <a href="./" aria-label="홈으로 이동"><img id="logoImg" src="maximo_tango_b.png" alt="Tango logo" width="120" height="36" style="height:36px;margin-left:12px;object-fit:contain" loading="lazy" onerror="this.style.display='none'"></a>
 </header>
 
 <main>
@@ -142,10 +142,17 @@
     <div class="field">
       <div class="head"><span>모델</span></div>
       <select id="model">
-        <option value="lite">Lite — 가장 빠름 (5.8MB)</option>
-        <option value="full" selected>Full — 균형 (9.4MB)</option>
-        <option value="heavy">Heavy — 가장 정확 (30MB)</option>
-      </select>
+          <option value="lite">Lite — 가장 빠름 (5.8MB)</option>
+          <option value="full" selected>Full — 균형 (9.4MB)</option>
+        </select>
+    </div>
+    <div class="field">
+      <div class="head"><span>감지 간격</span><span id="detectLbl">150ms</span></div>
+      <input type="range" id="detectInterval" min="50" max="1000" step="10" value="150">
+    </div>
+    <div class="field">
+      <div class="head"><span>크롭 최대 사이즈</span><span id="poseMaxLbl">512</span></div>
+      <input type="range" id="poseMax" min="128" max="1024" step="32" value="512">
     </div>
     <div class="field">
       <div class="head"><span>최대 인식 인원</span></div>
@@ -202,10 +209,11 @@ const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
 // ---------- 상수 ----------
 const MAXDIM = 1280;                                 // 캔버스 최대 변 길이(성능/녹화 용량)
-// HTML-side performance tuning
-const DETECT_INTERVAL_MS = 150;                      // run pose detection at most once per this many ms
+// HTML-side performance tuning (mutable via UI)
+let DETECT_INTERVAL_MS = 150;                      // run pose detection at most once per this many ms
 const DETECT_MAX_SIDE = 960;                         // downscale video to this side for detection
-const POSE_MAX_SIDE = 512;                           // downscale per-person crop for pose inference
+let POSE_MAX_SIDE = 512;                           // downscale per-person crop for pose inference
+const POSE_REUSE_MS = 400;                          // reuse recent pose for stable boxes (ms)
 const COLORS = ['#22d3ee', '#4ade80', '#fb923c', '#e879f9', '#60a5fa', '#facc15'];
 // MediaPipe Pose 33점 연결
 const CONN = [
@@ -226,7 +234,19 @@ let fps = 30, prevMT = null, minD = Infinity;
 let inferMs = 0, dragging = false;
 let lastInferAt = 0;
 let detector = null, haveDetectorModel = false;
+// Shared temporary canvases to avoid allocating per-frame/crop canvases
+const _shared = {
+  downscale: document.createElement('canvas'),
+  crop: document.createElement('canvas'),
+};
 const rec = { active: false, recorder: null, chunks: [], start: 0, end: 0, mime: '' };
+
+// lightweight tracker state to reduce redundant per-crop pose runs
+let lastDetBoxes = []; // array of {x1,y1,w,h,score,id}
+let lastDetTime = 0;
+let trackedPersons = []; // {id,bbox,lastPose,lastPoseTs}
+let _nextPersonId = 1;
+const IOU_MATCH = 0.3;
 
 const opts = {
   get model() { return $('#model').value; },
@@ -270,11 +290,14 @@ async function initLandmarker() {
   }
   try {
     fileset ??= await FilesetResolver.forVisionTasks(new URL('./vendor/wasm', location.href).href);
-    const make = (delegate) => PoseLandmarker.createFromOptions(fileset, {
-      baseOptions: {
-        modelAssetPath: new URL(`./models/pose_landmarker_${opts.model}.task`, location.href).href,
-        delegate,
-      },
+    const make = (delegate) => {
+      // map legacy "heavy" selection to "lite" so repo can omit the large heavy file
+      const modelName = (opts.model === 'heavy') ? 'lite' : opts.model;
+      return PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: new URL(`./models/pose_landmarker_${modelName}.task`, location.href).href,
+          delegate,
+        },
       runningMode: 'VIDEO',
       numPoses: opts.numPoses,
       minPoseDetectionConfidence: 0.5,
@@ -536,11 +559,11 @@ function loop() {
         // prepare downscaled canvas
         const vw = video.videoWidth, vh = video.videoHeight;
         const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(vw || 1, vh || 1));
-        if (scale < 1) {
+          if (scale < 1) {
           const dw = Math.round(vw * scale), dh = Math.round(vh * scale);
-          const tmp = document.createElement('canvas'); tmp.width = dw; tmp.height = dh;
-          const tctx = tmp.getContext('2d'); tctx.drawImage(video, 0, 0, dw, dh);
-          const ib = await createImageBitmap(tmp);
+          _shared.downscale.width = dw; _shared.downscale.height = dh;
+          const tctx = _shared.downscale.getContext('2d'); tctx.drawImage(video, 0, 0, dw, dh);
+          const ib = await createImageBitmap(_shared.downscale);
           if (landmarker.detect) {
             const r = landmarker.detect(ib);
             if (r) { result = r; detected = true; }
@@ -555,57 +578,72 @@ function loop() {
         // If user requested separate mode and detector available, run detector and per-crop pose
         if (opts.separate && detector && haveDetectorModel) {
           try {
-            const detRes = detector.detectForVideo ? detector.detectForVideo(video, lastTs) : detector.detect(video);
-            const dets = detRes?.detections ?? [];
-            // build result as landmarks array from per-crop detections
-            const landmarks = [];
-            for (const det of dets) {
-              try {
-                const bbox = det.boundingBox || det.bounding_box || det.locationData || null;
-                if (!bbox) continue;
-                // normalize bbox coordinates -> try multiple field names
+            const now = performance.now();
+            // reuse recent detector boxes when fresh to avoid re-running detector
+            let dets = [];
+            if (lastDetBoxes.length > 0 && (now - lastDetTime) < Math.max(100, DETECT_INTERVAL_MS * 1.2)) {
+              dets = lastDetBoxes.map(b => ({ boundingBox: { xMin: b.x1 / video.videoWidth, yMin: b.y1 / video.videoHeight, xMax: (b.x1 + b.w) / video.videoWidth, yMax: (b.y1 + b.h) / video.videoHeight } }));
+            } else {
+              const detRes = detector.detectForVideo ? detector.detectForVideo(video, lastTs) : detector.detect(video);
+              dets = detRes?.detections ?? [];
+              // cache absolute boxes for quick reuse
+              lastDetBoxes = dets.map(d => {
+                const bb = d.boundingBox || d.bounding_box || d.locationData || {};
                 const vw = video.videoWidth, vh = video.videoHeight;
-                let x1 = 0, y1 = 0, bw = 0, bh = 0;
-                if (bbox.originX !== undefined && bbox.originY !== undefined && bbox.width !== undefined && bbox.height !== undefined) {
-                  x1 = bbox.originX * vw; y1 = bbox.originY * vh; bw = bbox.width * vw; bh = bbox.height * vh;
-                } else if (bbox.xMin !== undefined && bbox.yMin !== undefined && bbox.xMax !== undefined && bbox.yMax !== undefined) {
-                  x1 = bbox.xMin * vw; y1 = bbox.yMin * vh; bw = (bbox.xMax - bbox.xMin) * vw; bh = (bbox.yMax - bbox.yMin) * vh;
-                } else if (bbox.xCenter !== undefined && bbox.yCenter !== undefined && bbox.width !== undefined && bbox.height !== undefined) {
-                  x1 = (bbox.xCenter - bbox.width/2) * vw; y1 = (bbox.yCenter - bbox.height/2) * vh; bw = bbox.width * vw; bh = bbox.height * vh;
-                } else continue;
-                // clamp
-                x1 = Math.max(0, Math.min(vw-1, x1)); y1 = Math.max(0, Math.min(vh-1, y1));
-                bw = Math.max(1, Math.min(vw - x1, bw)); bh = Math.max(1, Math.min(vh - y1, bh));
+                let x1=0,y1=0,w=0,h=0;
+                if (bb.originX!==undefined) { x1 = bb.originX * vw; y1 = bb.originY * vh; w = bb.width * vw; h = bb.height * vh; }
+                else if (bb.xMin!==undefined) { x1 = bb.xMin * vw; y1 = bb.yMin * vh; w = (bb.xMax - bb.xMin) * vw; h = (bb.yMax - bb.yMin) * vh; }
+                else if (bb.xCenter!==undefined) { x1 = (bb.xCenter - bb.width/2) * vw; y1 = (bb.yCenter - bb.height/2) * vh; w = bb.width * vw; h = bb.height * vh; }
+                return { x1: Math.max(0, x1), y1: Math.max(0,y1), w: Math.max(1,w), h: Math.max(1,h), score: d.score ?? (d.categories?.[0]?.score ?? 0) };
+              });
+              lastDetTime = now;
+            }
 
-                // crop and resize for pose
+            const iou = (a,b) => { const x1 = Math.max(a.x1,b.x1), y1 = Math.max(a.y1,b.y1); const x2 = Math.min(a.x1+a.w,b.x1+b.w), y2 = Math.min(a.y1+a.h,b.y1+b.h); const iw = Math.max(0,x2-x1), ih = Math.max(0,y2-y1); const inter = iw*ih; const union = a.w*a.h + b.w*b.h - inter; return union<=0?0:inter/union; };
+
+            const boxes = dets.map(d => {
+              const bb = d.boundingBox || d.bounding_box || d.locationData || {};
+              const vw = video.videoWidth, vh = video.videoHeight;
+              if (bb.originX!==undefined) return { x1: Math.max(0, bb.originX * vw), y1: Math.max(0, bb.originY * vh), w: Math.max(1, bb.width * vw), h: Math.max(1, bb.height * vh) };
+              if (bb.xMin!==undefined) return { x1: Math.max(0, bb.xMin * vw), y1: Math.max(0, bb.yMin * vh), w: Math.max(1, (bb.xMax - bb.xMin) * vw), h: Math.max(1, (bb.yMax - bb.yMin) * vh) };
+              if (bb.xCenter!==undefined) return { x1: Math.max(0, (bb.xCenter - bb.width/2) * vw), y1: Math.max(0, (bb.yCenter - bb.height/2) * vh), w: Math.max(1, bb.width * vw), h: Math.max(1, bb.height * vh) };
+              return null;
+            }).filter(Boolean);
+
+            // match to tracked persons
+            const newTracked = [];
+            for (const b of boxes) {
+              let matched = null, best = 0;
+              for (const p of trackedPersons) { const s = iou(p.bbox,b); if (s>best) { best=s; matched=p; } }
+              if (matched && best >= IOU_MATCH) { matched.bbox = b; matched.lastSeen = now; newTracked.push(matched); }
+              else { const id = _nextPersonId++; newTracked.push({ id, bbox: b, lastPose: null, lastPoseTs: 0, lastSeen: now }); }
+            }
+            trackedPersons = newTracked;
+
+            const landmarks = [];
+            for (const p of trackedPersons) {
+              try {
+                const bbox = p.bbox; const x1 = bbox.x1, y1 = bbox.y1, bw = bbox.w, bh = bbox.h;
                 const cw = Math.round(bw), ch = Math.round(bh);
                 const scale = Math.min(1, POSE_MAX_SIDE / Math.max(cw, ch));
                 const dw = Math.max(1, Math.round(cw * scale)), dh = Math.max(1, Math.round(ch * scale));
-                const tmp = document.createElement('canvas'); tmp.width = dw; tmp.height = dh;
-                const tctx = tmp.getContext('2d');
-                tctx.drawImage(video, x1, y1, cw, ch, 0, 0, dw, dh);
-                const ib = await createImageBitmap(tmp);
-                const pres = landmarker.detect ? landmarker.detect(ib) : null;
-                ib.close();
-                if (!pres || !pres.landmarks || pres.landmarks.length === 0) continue;
-                // take first pose landmarks and map back to full video coordinates
-                const lm = pres.landmarks[0];
-                // landmarks are normalized to crop; convert to absolute
-                const mapped = lm.map(p => ({ x: (p.x * (dw / scale)) / (cw) * bw / bw * bw, y: (p.y * (dh / scale)) / (ch) * bh / bh * bh, visibility: p.visibility }));
-                // simpler mapping: p.x * bw + x1
-                const final = lm.map(p => ({ x: p.x * bw + x1, y: p.y * bh + y1, visibility: p.visibility }));
-                landmarks.push(final);
+                const needPose = !(p.lastPose && (performance.now() - p.lastPoseTs) < POSE_REUSE_MS);
+                if (needPose) {
+                  _shared.crop.width = dw; _shared.crop.height = dh; const tctx = _shared.crop.getContext('2d');
+                  tctx.drawImage(video, x1, y1, cw, ch, 0, 0, dw, dh);
+                  const ib = await createImageBitmap(_shared.crop);
+                  const pres = landmarker.detect ? landmarker.detect(ib) : null; ib.close();
+                  if (pres && pres.landmarks && pres.landmarks.length > 0) {
+                    const lm = pres.landmarks[0];
+                    const final = lm.map(pnt => ({ x: pnt.x * bw + x1, y: pnt.y * bh + y1, visibility: pnt.visibility }));
+                    p.lastPose = final; p.lastPoseTs = performance.now();
+                  }
+                }
+                if (p.lastPose) landmarks.push(p.lastPose);
               } catch (e) { console.debug('per-crop pose failed', e); }
             }
-            if (landmarks.length > 0) {
-              // build synthetic result similar to PoseLandmarker.detectForVideo
-              result = { landmarks };
-              detected = true;
-            } else {
-              // fallback to detectForVideo
-              try { result = landmarker.detectForVideo(video, lastTs); }
-              catch (e) { console.warn('detect 실패', e); }
-            }
+            if (landmarks.length > 0) { result = { landmarks }; detected = true; }
+            else { try { result = landmarker.detectForVideo(video, lastTs); } catch (e) { console.warn('detect 실패', e); } }
           } catch (e) {
             console.warn('detector path failed', e);
             try { result = landmarker.detectForVideo(video, lastTs); }

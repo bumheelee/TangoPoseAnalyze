@@ -41,6 +41,10 @@ MODELS = {
     "x - 가장 정확": "yolo11x-pose.pt",
 }
 PREVIEW_W, PREVIEW_H = 720, 405
+# Performance tuning
+MAX_DETECT_W = 960       # max width for detector input (downscale large frames)
+DETECT_INTERVAL = 3      # run person detector every N frames (reuse boxes between)
+POSE_MAX_SIDE = 512      # max side for pose crop inference
 
 
 def draw_person(img, kpts, conf, color, min_conf, line_w, dot_r):
@@ -393,6 +397,18 @@ class App(tk.Tk):
         frm = ttk.Frame(root)
         frm.pack(padx=10, pady=10)
 
+        # try to load project logo from workspace
+        try:
+            logo_path = Path(__file__).resolve().parent / "maximo_tango_b.png"
+            if logo_path.exists():
+                logo_img = Image.open(logo_path)
+                logo_img.thumbnail((180, 60), Image.LANCZOS)
+                self._logo_photo = ImageTk.PhotoImage(logo_img)
+                ttk.Label(frm, image=self._logo_photo).grid(row=0, column=3, rowspan=4,
+                                                            sticky="ne", padx=8, pady=2)
+        except Exception:
+            pass
+
         ttk.Label(frm, text="입력 동영상").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(frm, textvariable=self.in_var, width=60).grid(row=0, column=1, **pad)
         ttk.Button(frm, text="찾기", command=self.pick_input).grid(row=0, column=2, **pad)
@@ -578,41 +594,72 @@ class App(tk.Tk):
 
                 canvas = frame * 0 if p["black"] else frame
 
+                # performance: run detector at lower resolution and only every N frames
+                boxes = []
                 if detector is not None:
-                    # Detect persons first, then run pose on each crop to separate close/overlapping people
-                    dets = detector(frame, conf=p["min_conf"], classes=[0], verbose=False)[0]
-                    boxes = []
-                    if hasattr(dets, "boxes") and dets.boxes is not None:
-                        xyxy = dets.boxes.xyxy.cpu().numpy()
-                        for b in xyxy:
-                            x1, y1, x2, y2 = [int(v) for v in b]
-                            # ensure valid box
-                            x1 = max(0, min(x1, frame.shape[1] - 1))
-                            x2 = max(0, min(x2, frame.shape[1] - 1))
-                            y1 = max(0, min(y1, frame.shape[0] - 1))
-                            y2 = max(0, min(y2, frame.shape[0] - 1))
-                            if x2 > x1 and y2 > y1:
-                                boxes.append((x1, y1, x2, y2))
+                    if n % DETECT_INTERVAL == 0:
+                        # downscale frame for detection when wide
+                        detect_frame = frame
+                        scale = 1.0
+                        if frame.shape[1] > MAX_DETECT_W:
+                            scale = MAX_DETECT_W / frame.shape[1]
+                            detect_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+                        dets = detector(detect_frame, conf=p["min_conf"], classes=[0], verbose=False)[0]
+                        if hasattr(dets, "boxes") and dets.boxes is not None:
+                            xyxy = dets.boxes.xyxy.cpu().numpy()
+                            for b in xyxy:
+                                x1, y1, x2, y2 = [int(v / scale) for v in b]
+                                # clamp
+                                x1 = max(0, min(x1, frame.shape[1] - 1))
+                                x2 = max(0, min(x2, frame.shape[1] - 1))
+                                y1 = max(0, min(y1, frame.shape[0] - 1))
+                                y2 = max(0, min(y2, frame.shape[0] - 1))
+                                if x2 > x1 and y2 > y1:
+                                    boxes.append((x1, y1, x2, y2))
+                        # store last boxes on 'boxes' variable for this frame
+                    # if not detection frame, boxes remains empty (no new boxes), skip per-crop pose
 
+                if boxes:
                     ids = list(range(len(boxes)))
                     for pid, (x1, y1, x2, y2) in zip(ids, boxes):
                         crop = frame[y1:y2, x1:x2]
                         if crop.size == 0:
                             continue
+                        # resize crop for faster pose inference
+                        ch, cw = crop.shape[:2]
+                        scale_c = 1.0
+                        if max(ch, cw) > POSE_MAX_SIDE:
+                            scale_c = POSE_MAX_SIDE / max(ch, cw)
+                            icrop = cv2.resize(crop, (0, 0), fx=scale_c, fy=scale_c)
+                        else:
+                            icrop = crop
                         try:
-                            cres = pose_model(crop, conf=p["min_conf"], verbose=False)[0]
+                            cres = pose_model(icrop, conf=p["min_conf"], verbose=False)[0]
                         except Exception:
                             continue
                         if cres.keypoints is None or len(cres.keypoints) == 0:
                             continue
-                        # take first detected pose in the crop
+                        # take first detected pose in the crop and scale back
                         k = cres.keypoints.xy.cpu().numpy()[0]
                         c = cres.keypoints.conf.cpu().numpy()[0]
+                        if scale_c != 1.0:
+                            k *= (1.0 / scale_c)
                         # offset to original frame coords
                         k[:, 0] += x1
                         k[:, 1] += y1
                         draw_person(canvas, k, c, COLORS[pid % len(COLORS)],
                                     p["min_conf"], p["line_w"], dot_r)
+                else:
+                    # Fallback: use single pose model with tracking as before
+                    res = pose_model.track(frame, persist=True, verbose=False)[0]
+                    if res.keypoints is not None and len(res.keypoints) > 0:
+                        xy = res.keypoints.xy.cpu().numpy()
+                        cf = res.keypoints.conf.cpu().numpy()
+                        ids = (res.boxes.id.int().cpu().tolist()
+                               if res.boxes.id is not None else list(range(len(xy))))
+                        for pid, k, c in zip(ids, xy, cf):
+                            draw_person(canvas, k, c, COLORS[pid % len(COLORS)],
+                                        p["min_conf"], p["line_w"], dot_r)
                 else:
                     # Fallback: use single pose model with tracking as before
                     res = pose_model.track(frame, persist=True, verbose=False)[0]
