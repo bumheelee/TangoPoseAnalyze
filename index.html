@@ -7,7 +7,7 @@
 <meta http-equiv="Content-Security-Policy" content="connect-src 'self' blob: data:">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>동영상 관절 스켈레톤</title>
-<link rel="icon" href="data:,">
+<link rel="icon" type="image/png" href="maximo_tango_b.png">
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e8ee;
@@ -16,9 +16,11 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 17px; }
   header span { color: var(--muted); font-size: 12.5px; }
+  header .logo { display: block; flex: 0 0 auto; }
+  header .logo img { display: block; width: 120px; height: 36px; object-fit: contain; }
   main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; padding: 16px 20px 28px; max-width: 1400px; margin: 0 auto; }
   @media (max-width: 920px) { main { grid-template-columns: 1fr; } }
 
@@ -54,6 +56,8 @@
   button:disabled { opacity: .45; cursor: default; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button.primary:hover:not(:disabled) { background: #2f6fe0; }
+  .file-open { display: inline-block; cursor: pointer; }
+  .file-input { position: fixed; width: 1px; height: 1px; opacity: 0; overflow: hidden; clip-path: inset(50%); }
   button.danger { background: #b91c1c; border-color: #b91c1c; color: #fff; }
   button.mini { padding: 4px 8px; font-size: 12.5px; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -80,9 +84,9 @@
 </head>
 <body>
 <header>
+  <a class="logo" href="./" aria-label="홈으로 이동"><img id="logoImg" src="maximo_tango_b.png" alt="Tango logo" width="120" height="36" loading="lazy" onerror="this.style.display='none'"></a>
   <h1>동영상 관절 스켈레톤</h1>
   <span>영상은 서버로 업로드되지 않고 이 브라우저 안에서만 처리됩니다.</span>
-  <a href="./" aria-label="홈으로 이동"><img id="logoImg" src="maximo_tango_b.png" alt="Tango logo" width="120" height="36" style="height:36px;margin-left:12px;object-fit:contain" loading="lazy" onerror="this.style.display='none'"></a>
 </header>
 
 <main>
@@ -92,7 +96,8 @@
       <div class="drop" id="drop">
         <div style="font-size:15px;color:var(--text)">동영상을 여기로 끌어다 놓으세요</div>
         <div>또는</div>
-        <button class="primary" id="openBtn">동영상 열기</button>
+        <label class="primary file-open" for="videoFile">동영상 열기</label>
+        <input class="file-input" id="videoFile" type="file" accept="video/*,.mp4,.mov,.m4v,.webm">
       </div>
       <div class="badge busy" id="badge">모델 로딩 중…</div>
       <div class="stats" id="stats" hidden></div>
@@ -205,7 +210,7 @@
 <div id="toast"></div>
 
 <script type="module">
-import { FilesetResolver, PoseLandmarker } from "./vendor/vision_bundle.mjs";
+import { FilesetResolver, ObjectDetector, PoseLandmarker } from "./vendor/vision_bundle.mjs";
 
 const $ = (s) => document.querySelector(s);
 const video = $('#v'), cv = $('#cv'), ctx = cv.getContext('2d');
@@ -235,7 +240,7 @@ let result = null, frameReady = false, forceDetect = false, lastDetectT = -1, la
 let a = null, b = null;
 let fps = 30, prevMT = null, minD = Infinity;
 let inferMs = 0, dragging = false;
-let lastInferAt = 0;
+let lastInferAt = 0, inferBusy = false;
 let detector = null, haveDetectorModel = false;
 // Shared temporary canvases to avoid allocating per-frame/crop canvases
 const _shared = {
@@ -351,6 +356,7 @@ async function initLandmarker() {
       minPosePresenceConfidence: 0.5,
       minTrackingConfidence: 0.5,
     });
+    };
     let lm, used = opts.delegate;
     try { lm = await make(used); }
     catch (e) {
@@ -404,7 +410,10 @@ async function initLandmarker() {
 // ---------- 동영상 열기 ----------
 function openFile(file) {
   if (!file) return;
-  if (!file.type.startsWith('video/')) { toast('동영상 파일만 열 수 있습니다.'); return; }
+  const extension = file.name.split('.').pop().toLowerCase();
+  if (!file.type.startsWith('video/') && !['mp4', 'mov', 'm4v', 'webm', '3gp', '3g2'].includes(extension)) {
+    toast('동영상 파일만 열 수 있습니다.'); return;
+  }
   if (rec.active) stopRecording();
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(file);
@@ -432,11 +441,9 @@ video.addEventListener('ended', () => {
   updatePlayBtn();
 });
 
-$('#openBtn').addEventListener('click', () => {
-  const inp = document.createElement('input');
-  inp.type = 'file'; inp.accept = 'video/*';
-  inp.onchange = () => openFile(inp.files[0]);
-  inp.click();
+$('#videoFile').addEventListener('change', (e) => {
+  openFile(e.target.files[0]);
+  e.target.value = '';
 });
 window.addEventListener('dragover', (e) => { e.preventDefault(); $('#drop').classList.add('over'); });
 window.addEventListener('dragleave', () => $('#drop').classList.remove('over'));
@@ -526,7 +533,7 @@ $('#setB').addEventListener('click', setB);
 $('#clearAB').addEventListener('click', () => { a = b = null; refreshAB(); });
 
 // ---------- 옵션 ----------
-['model', 'numPoses', 'delegate'].forEach((id) => $('#' + id).addEventListener('change', initLandmarker));
+['model', 'numPoses', 'delegate', 'separate'].forEach((id) => $('#' + id).addEventListener('change', initLandmarker));
 $('#minVis').addEventListener('input', (e) => { $('#visLbl').textContent = parseFloat(e.target.value).toFixed(2); });
 $('#lineW').addEventListener('input', (e) => { $('#lwLbl').textContent = e.target.value; });
 $('#sound').addEventListener('change', (e) => { video.muted = !e.target.checked; });
@@ -599,15 +606,16 @@ if (HAS_RVFC) {
   video.requestVideoFrameCallback(onFrame);
 }
 let lastTimeStr = '', lastStats = 0;
-function loop() {
+async function loop() {
   requestAnimationFrame(loop);
   if (!hasVideo || video.readyState < 2 || !sizeCanvas()) return;
 
   const t = video.currentTime;
   const isNew = HAS_RVFC ? frameReady : (t !== lastDetectT);
   const now = performance.now();
-  const canDetect = (now - lastInferAt) >= DETECT_INTERVAL_MS || forceDetect;
+  const canDetect = !inferBusy && ((now - lastInferAt) >= DETECT_INTERVAL_MS || forceDetect);
   if ((isNew || forceDetect) && !video.seeking && landmarker && canDetect) {
+    inferBusy = true;
     lastTs = Math.max(lastTs + 1, performance.now());     // VIDEO 모드는 단조 증가 타임스탬프가 필요
     const t0 = performance.now();
     try {
@@ -617,15 +625,14 @@ function loop() {
         // prepare downscaled canvas (use worker if available)
         const vw = video.videoWidth, vh = video.videoHeight;
         const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(vw || 1, vh || 1));
-        if (scale < 1) {
+        if (scale < 1 && !(opts.separate && detector && haveDetectorModel)) {
           const dw = Math.round(vw * scale), dh = Math.round(vh * scale);
           try {
             const ib = await createDownscaledBitmap(dw, dh);
-            if (landmarker.detect) {
-              const r = landmarker.detect(ib);
+            try {
+              const r = landmarker.detectForVideo(ib, lastTs);
               if (r) { result = r; detected = true; }
-            }
-            try { ib.close && ib.close(); } catch (e) {}
+            } finally { try { ib.close && ib.close(); } catch (e) {} }
           } catch (e) { console.debug('fast detect worker path failed', e); }
         }
       } catch (err) {
@@ -649,7 +656,7 @@ function loop() {
                 const bb = d.boundingBox || d.bounding_box || d.locationData || {};
                 const vw = video.videoWidth, vh = video.videoHeight;
                 let x1=0,y1=0,w=0,h=0;
-                if (bb.originX!==undefined) { x1 = bb.originX * vw; y1 = bb.originY * vh; w = bb.width * vw; h = bb.height * vh; }
+                if (bb.originX!==undefined) { x1 = bb.originX; y1 = bb.originY; w = bb.width; h = bb.height; }
                 else if (bb.xMin!==undefined) { x1 = bb.xMin * vw; y1 = bb.yMin * vh; w = (bb.xMax - bb.xMin) * vw; h = (bb.yMax - bb.yMin) * vh; }
                 else if (bb.xCenter!==undefined) { x1 = (bb.xCenter - bb.width/2) * vw; y1 = (bb.yCenter - bb.height/2) * vh; w = bb.width * vw; h = bb.height * vh; }
                 return { x1: Math.max(0, x1), y1: Math.max(0,y1), w: Math.max(1,w), h: Math.max(1,h), score: d.score ?? (d.categories?.[0]?.score ?? 0) };
@@ -662,7 +669,7 @@ function loop() {
             const boxes = dets.map(d => {
               const bb = d.boundingBox || d.bounding_box || d.locationData || {};
               const vw = video.videoWidth, vh = video.videoHeight;
-              if (bb.originX!==undefined) return { x1: Math.max(0, bb.originX * vw), y1: Math.max(0, bb.originY * vh), w: Math.max(1, bb.width * vw), h: Math.max(1, bb.height * vh) };
+              if (bb.originX!==undefined) return { x1: Math.max(0, bb.originX), y1: Math.max(0, bb.originY), w: Math.max(1, bb.width), h: Math.max(1, bb.height) };
               if (bb.xMin!==undefined) return { x1: Math.max(0, bb.xMin * vw), y1: Math.max(0, bb.yMin * vh), w: Math.max(1, (bb.xMax - bb.xMin) * vw), h: Math.max(1, (bb.yMax - bb.yMin) * vh) };
               if (bb.xCenter!==undefined) return { x1: Math.max(0, (bb.xCenter - bb.width/2) * vw), y1: Math.max(0, (bb.yCenter - bb.height/2) * vh), w: Math.max(1, bb.width * vw), h: Math.max(1, bb.height * vh) };
               return null;
@@ -708,7 +715,11 @@ function loop() {
                   _shared.crop.width = dw; _shared.crop.height = dh; const tctx = _shared.crop.getContext('2d');
                   tctx.drawImage(video, x1, y1, cw, ch, 0, 0, dw, dh);
                   const ib = await createImageBitmap(_shared.crop);
-                  const pres = landmarker.detect ? landmarker.detect(ib) : null; ib.close();
+                  let pres;
+                  try {
+                    lastTs += 1;
+                    pres = landmarker.detectForVideo(ib, lastTs);
+                  } finally { try { ib.close(); } catch (e) {} }
                   if (pres && pres.landmarks && pres.landmarks.length > 0) {
                     const lm = pres.landmarks[0];
                     const final = lm.map(pnt => ({ x: pnt.x * bw + x1, y: pnt.y * bh + y1, visibility: pnt.visibility }));
@@ -733,6 +744,7 @@ function loop() {
     } catch (e) { console.warn('detect 실패', e); }
     inferMs = inferMs * 0.8 + (performance.now() - t0) * 0.2;
     lastInferAt = performance.now();
+    inferBusy = false;
     frameReady = false; forceDetect = false; lastDetectT = t;
   }
   draw();
@@ -743,9 +755,9 @@ function loop() {
   const ts = `${fmt(t)} / ${fmt(dur)}`;
   if (ts !== lastTimeStr) { $('#timeEl').textContent = ts; lastTimeStr = ts; }
 
-  const now = performance.now();
-  if (now - lastStats > 400) {
-    lastStats = now;
+  const statsNow = performance.now();
+  if (statsNow - lastStats > 400) {
+    lastStats = statsNow;
     const el = $('#stats');
     el.hidden = !landmarker;
     el.textContent = `추론 ${inferMs.toFixed(0)}ms · ${result ? result.landmarks.length : 0}명`;
