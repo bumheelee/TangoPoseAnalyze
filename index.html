@@ -156,8 +156,8 @@
       <input type="range" id="detectInterval" min="50" max="1000" step="10" value="150">
     </div>
     <div class="field">
-      <div class="head"><span>크롭 최대 사이즈</span><span id="poseMaxLbl">512</span></div>
-      <input type="range" id="poseMax" min="128" max="1024" step="32" value="512">
+      <div class="head"><span>크롭 최대 사이즈</span><span id="poseMaxLbl">768</span></div>
+      <input type="range" id="poseMax" min="128" max="1024" step="32" value="768">
     </div>
     <div class="field">
       <div class="head"><span>포즈 재사용(ms)</span><span id="poseReuseLbl">400</span></div>
@@ -190,7 +190,7 @@
     <label class="chk"><input type="checkbox" id="showSk" checked> 뼈대 표시</label>
     <label class="chk"><input type="checkbox" id="black"> 검은 배경에 뼈대만</label>
     <label class="chk"><input type="checkbox" id="hideFace" checked> 얼굴 세부점 숨기기 (코만 표시)</label>
-    <label class="chk"><input type="checkbox" id="separate"> 사람별 개별 포즈 추출 (정확도↑, 느림↑)</label>
+    <label class="chk"><input type="checkbox" id="separate" checked> 사람별 개별 포즈 추출 (겹침 장면에 유리, 느림)</label>
     <label class="chk"><input type="checkbox" id="sound"> 소리 켜기</label>
 
     <div class="hr"></div>
@@ -221,7 +221,7 @@ const MAXDIM = 1280;                                 // 캔버스 최대 변 길
 // HTML-side performance tuning (mutable via UI)
 let DETECT_INTERVAL_MS = 150;                      // run pose detection at most once per this many ms
 const DETECT_MAX_SIDE = 960;                         // downscale video to this side for detection
-let POSE_MAX_SIDE = 512;                           // downscale per-person crop for pose inference
+let POSE_MAX_SIDE = 768;                           // downscale per-person crop for pose inference
 const COLORS = ['#22d3ee', '#4ade80', '#fb923c', '#e879f9', '#60a5fa', '#facc15'];
 // MediaPipe Pose 33점 연결
 const CONN = [
@@ -380,7 +380,7 @@ async function initLandmarker() {
           baseOptions: { modelAssetPath: path, delegate: d },
           runningMode: 'VIDEO',
           scoreThreshold: 0.35,
-          maxResults: 6,
+          maxResults: Math.max(6, opts.numPoses * 2),
         });
         let detUsed = opts.delegate;
         try {
@@ -650,7 +650,11 @@ async function loop() {
               dets = lastDetBoxes.map(b => ({ boundingBox: { xMin: b.x1 / video.videoWidth, yMin: b.y1 / video.videoHeight, xMax: (b.x1 + b.w) / video.videoWidth, yMax: (b.y1 + b.h) / video.videoHeight } }));
             } else {
               const detRes = detector.detectForVideo ? detector.detectForVideo(video, lastTs) : detector.detect(video);
-              dets = detRes?.detections ?? [];
+              dets = (detRes?.detections ?? []).filter((d) => {
+                const category = d.categories?.[0];
+                const label = `${category?.categoryName ?? ''} ${category?.displayName ?? ''}`.trim();
+                return !label || /\bperson\b/i.test(label);
+              });
               // cache absolute boxes for quick reuse
               lastDetBoxes = dets.map(d => {
                 const bb = d.boundingBox || d.bounding_box || d.locationData || {};
@@ -673,7 +677,7 @@ async function loop() {
               if (bb.xMin!==undefined) return { x1: Math.max(0, bb.xMin * vw), y1: Math.max(0, bb.yMin * vh), w: Math.max(1, (bb.xMax - bb.xMin) * vw), h: Math.max(1, (bb.yMax - bb.yMin) * vh) };
               if (bb.xCenter!==undefined) return { x1: Math.max(0, (bb.xCenter - bb.width/2) * vw), y1: Math.max(0, (bb.yCenter - bb.height/2) * vh), w: Math.max(1, bb.width * vw), h: Math.max(1, bb.height * vh) };
               return null;
-            }).filter(Boolean);
+            }).filter(Boolean).slice(0, opts.numPoses);
 
             // match to tracked persons (use Kalman predicted centers when available)
             const newTracked = [];
@@ -706,8 +710,12 @@ async function loop() {
             const landmarks = [];
             for (const p of trackedPersons) {
               try {
-                const bbox = p.bbox; const x1 = bbox.x1, y1 = bbox.y1, bw = bbox.w, bh = bbox.h;
-                const cw = Math.round(bw), ch = Math.round(bh);
+                const bbox = p.bbox;
+                const padX = bbox.w * 0.15, padY = bbox.h * 0.12;
+                const x1 = Math.max(0, bbox.x1 - padX), y1 = Math.max(0, bbox.y1 - padY);
+                const x2 = Math.min(video.videoWidth, bbox.x1 + bbox.w + padX);
+                const y2 = Math.min(video.videoHeight, bbox.y1 + bbox.h + padY);
+                const cw = Math.max(1, Math.round(x2 - x1)), ch = Math.max(1, Math.round(y2 - y1));
                 const scale = Math.min(1, POSE_MAX_SIDE / Math.max(cw, ch));
                 const dw = Math.max(1, Math.round(cw * scale)), dh = Math.max(1, Math.round(ch * scale));
                 const needPose = !(p.lastPose && (performance.now() - p.lastPoseTs) < POSE_REUSE_MS);
@@ -722,7 +730,11 @@ async function loop() {
                   } finally { try { ib.close(); } catch (e) {} }
                   if (pres && pres.landmarks && pres.landmarks.length > 0) {
                     const lm = pres.landmarks[0];
-                    const final = lm.map(pnt => ({ x: pnt.x * bw + x1, y: pnt.y * bh + y1, visibility: pnt.visibility }));
+                    const final = lm.map(pnt => ({
+                      x: (pnt.x * cw + x1) / video.videoWidth,
+                      y: (pnt.y * ch + y1) / video.videoHeight,
+                      visibility: pnt.visibility,
+                    }));
                     p.lastPose = final; p.lastPoseTs = performance.now();
                   }
                 }
