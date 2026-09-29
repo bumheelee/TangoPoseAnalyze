@@ -26,6 +26,7 @@
 
   .screen { position: relative; background: #000; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
     display: flex; align-items: center; justify-content: center; min-height: 240px; }
+  .screen.marking { cursor: crosshair; }
   #cv { display: block; max-width: 100%; max-height: 70vh; width: auto; height: auto; }
   .drop { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 10px; text-align: center; color: var(--muted); padding: 20px; border: 2px dashed var(--line); border-radius: 10px; margin: 10px; }
@@ -149,6 +150,7 @@
       <select id="model">
           <option value="lite">Lite — 가장 빠름 (5.8MB)</option>
           <option value="full" selected>Full — 균형 (9.4MB)</option>
+          <option value="heavy">Heavy — 정확도 우선 (29.3MB)</option>
         </select>
     </div>
     <div class="field">
@@ -194,6 +196,23 @@
     <label class="chk"><input type="checkbox" id="sound"> 소리 켜기</label>
 
     <div class="hr"></div>
+    <h2>수동 마커</h2>
+    <div class="field">
+      <div class="head"><span>마커 이름</span><span id="manualMarkerCount">0개</span></div>
+      <select id="manualMarkerLabel" title="영상 위를 클릭해 선택한 관절에 마커를 놓습니다.">
+        <option>코</option><option>왼쪽 어깨</option><option>오른쪽 어깨</option>
+        <option>왼쪽 팔꿈치</option><option>오른쪽 팔꿈치</option>
+        <option>왼쪽 손목</option><option>오른쪽 손목</option>
+        <option>골반</option><option>왼쪽 무릎</option><option>오른쪽 무릎</option>
+        <option>왼쪽 발목</option><option>오른쪽 발목</option><option>기타</option>
+      </select>
+    </div>
+    <div class="row">
+      <label class="chk" style="margin:0"><input type="checkbox" id="manualMarkerMode"> 마커 찍기</label>
+      <button id="clearManualMarkers" class="mini" title="수동 마커 전체 삭제">전체 삭제</button>
+    </div>
+
+    <div class="hr"></div>
     <div class="btns">
       <button id="snapBtn">현재 화면 PNG 저장</button>
       <button id="recBtn">뼈대 영상 녹화 · 저장</button>
@@ -223,6 +242,7 @@ let DETECT_INTERVAL_MS = 150;                      // run pose detection at most
 const DETECT_MAX_SIDE = 960;                         // downscale video to this side for detection
 let POSE_MAX_SIDE = 768;                           // downscale per-person crop for pose inference
 const COLORS = ['#22d3ee', '#4ade80', '#fb923c', '#e879f9', '#60a5fa', '#facc15'];
+const POSE_SMOOTHING = 0.35;
 // MediaPipe Pose 33점 연결
 const CONN = [
   [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
@@ -246,7 +266,12 @@ let detector = null, haveDetectorModel = false;
 const _shared = {
   downscale: document.createElement('canvas'),
   crop: document.createElement('canvas'),
+  marker: document.createElement('canvas'),
 };
+const manualMarkers = [];
+const MARKER_PATCH_RADIUS = 4;
+const MARKER_SEARCH_RADIUS = 24;
+let lastManualTrackAt = 0, lastManualTrackTime = -1;
 // Preproc worker (OffscreenCanvas) for downscaling frames to reduce main-thread load
 let preprocWorker = null;
 try {
@@ -263,6 +288,7 @@ let lastDetTime = 0;
 let trackedPersons = []; // {id,bbox,lastPose,lastPoseTs}
 let _nextPersonId = 1;
 const IOU_MATCH = 0.3;
+const TRACK_HOLD_MS = 200;
 
 // Kalman filter for bbox center smoothing (simple 1D filters per axis)
 class Kalman1D {
@@ -343,8 +369,7 @@ async function initLandmarker() {
   try {
     fileset ??= await FilesetResolver.forVisionTasks(new URL('./vendor/wasm', location.href).href);
     const make = (delegate) => {
-      // map legacy "heavy" selection to "lite" so repo can omit the large heavy file
-      const modelName = (opts.model === 'heavy') ? 'lite' : opts.model;
+      const modelName = opts.model;
       return PoseLandmarker.createFromOptions(fileset, {
         baseOptions: {
           modelAssetPath: new URL(`./models/pose_landmarker_${modelName}.task`, location.href).href,
@@ -415,6 +440,7 @@ function openFile(file) {
     toast('동영상 파일만 열 수 있습니다.'); return;
   }
   if (rec.active) stopRecording();
+  clearManualMarkers();
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(file);
   baseName = file.name.replace(/\.[^.]+$/, '');
@@ -432,7 +458,10 @@ video.addEventListener('error', () => {
   hasVideo = false; $('#drop').hidden = false;
   toast('이 브라우저에서 재생할 수 없는 형식입니다. (mp4/H.264 또는 webm을 권장)');
 });
-video.addEventListener('seeked', () => { forceDetect = true; });
+video.addEventListener('seeked', () => {
+  forceDetect = true;
+  for (const marker of manualMarkers) { marker.template = null; marker.confidence = 0; }
+});
 video.addEventListener('play', updatePlayBtn);
 video.addEventListener('pause', updatePlayBtn);
 video.addEventListener('ended', () => {
@@ -586,10 +615,105 @@ function draw() {
   const W = cv.width, H = cv.height;
   if (opts.black) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); }
   else ctx.drawImage(video, 0, 0, W, H);
-  if (!opts.show || !result) return;
-  const lw = Math.max(1, opts.lineW * W / 960);
-  result.landmarks.forEach((lm, i) => drawPerson(lm, COLORS[i % COLORS.length], W, H, lw));
+  if (opts.show && result) {
+    const lw = Math.max(1, opts.lineW * W / 960);
+    result.landmarks.forEach((lm, i) => drawPerson(lm, COLORS[i % COLORS.length], W, H, lw));
+  }
+  drawManualMarkers(W, H);
 }
+
+function captureManualGray() {
+  const W = cv.width, H = cv.height;
+  _shared.marker.width = W; _shared.marker.height = H;
+  const markerCtx = _shared.marker.getContext('2d', { willReadFrequently: true });
+  markerCtx.drawImage(video, 0, 0, W, H);
+  const rgba = markerCtx.getImageData(0, 0, W, H).data;
+  const gray = new Uint8Array(W * H);
+  for (let i = 0, p = 0; i < rgba.length; i += 4, p++) {
+    gray[p] = (rgba[i] * 3 + rgba[i + 1] * 6 + rgba[i + 2]) / 10;
+  }
+  return gray;
+}
+
+function markerPatch(gray, x, y, W, H) {
+  const radius = MARKER_PATCH_RADIUS;
+  const cx = Math.round(clamp(x, radius, W - radius - 1));
+  const cy = Math.round(clamp(y, radius, H - radius - 1));
+  const patch = new Uint8Array((radius * 2 + 1) ** 2);
+  let index = 0;
+  for (let py = -radius; py <= radius; py++) {
+    for (let px = -radius; px <= radius; px++) patch[index++] = gray[(cy + py) * W + cx + px];
+  }
+  return { x: cx, y: cy, patch };
+}
+
+function updateManualMarkers(now) {
+  if (!manualMarkers.length || video.seeking || video.currentTime === lastManualTrackTime || now - lastManualTrackAt < 30) return;
+  lastManualTrackTime = video.currentTime; lastManualTrackAt = now;
+  const W = cv.width, H = cv.height, gray = captureManualGray();
+  const patchLength = (MARKER_PATCH_RADIUS * 2 + 1) ** 2;
+  for (const marker of manualMarkers) {
+    if (!marker.template) continue;
+    const centerX = marker.x * W, centerY = marker.y * H;
+    let bestError = Infinity, bestDistance = Infinity, bestX = centerX, bestY = centerY;
+    for (let dy = -MARKER_SEARCH_RADIUS; dy <= MARKER_SEARCH_RADIUS; dy += 2) {
+      for (let dx = -MARKER_SEARCH_RADIUS; dx <= MARKER_SEARCH_RADIUS; dx += 2) {
+        const x = Math.round(centerX + dx), y = Math.round(centerY + dy);
+        if (x < MARKER_PATCH_RADIUS || y < MARKER_PATCH_RADIUS || x >= W - MARKER_PATCH_RADIUS || y >= H - MARKER_PATCH_RADIUS) continue;
+        let error = 0, index = 0;
+        for (let py = -MARKER_PATCH_RADIUS; py <= MARKER_PATCH_RADIUS; py++) {
+          for (let px = -MARKER_PATCH_RADIUS; px <= MARKER_PATCH_RADIUS; px++) {
+            error += Math.abs(marker.template[index++] - gray[(y + py) * W + x + px]);
+          }
+        }
+        error /= patchLength;
+        const distance = dx * dx + dy * dy;
+        if (error < bestError - 0.25 || (Math.abs(error - bestError) <= 0.25 && distance < bestDistance)) {
+          bestError = error; bestDistance = distance; bestX = x; bestY = y;
+        }
+      }
+    }
+    marker.confidence = Math.max(0, 1 - bestError / 48);
+    if (bestError > 32) continue;
+    marker.x = bestX / W; marker.y = bestY / H;
+    const nextPatch = markerPatch(gray, bestX, bestY, W, H).patch;
+    for (let i = 0; i < patchLength; i++) marker.template[i] = marker.template[i] * 0.97 + nextPatch[i] * 0.03;
+  }
+}
+
+function drawManualMarkers(W, H) {
+  for (const marker of manualMarkers) {
+    const x = marker.x * W, y = marker.y * H;
+    const color = !marker.template ? '#fbbf24'
+      : marker.confidence < 0.3 ? '#f87171' : COLORS[marker.id % COLORS.length];
+    ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+    ctx.font = '600 13px system-ui, sans-serif'; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.8)';
+    ctx.strokeText(marker.label, x + 10, y - 9); ctx.fillStyle = '#fff'; ctx.fillText(marker.label, x + 10, y - 9);
+  }
+}
+
+function renderManualMarkerCount() { $('#manualMarkerCount').textContent = `${manualMarkers.length}개`; }
+function clearManualMarkers() { manualMarkers.length = 0; lastManualTrackTime = -1; renderManualMarkerCount(); }
+
+$('#manualMarkerMode').addEventListener('change', (e) => $('#screen').classList.toggle('marking', e.target.checked));
+$('#clearManualMarkers').addEventListener('click', clearManualMarkers);
+cv.addEventListener('pointerdown', (e) => {
+  if (!$('#manualMarkerMode').checked || !hasVideo) return;
+  const rect = cv.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * cv.width / rect.width;
+  const y = (e.clientY - rect.top) * cv.height / rect.height;
+  const gray = captureManualGray();
+  const point = markerPatch(gray, x, y, cv.width, cv.height);
+  const existing = manualMarkers.find((marker) => Math.hypot(marker.x * cv.width - point.x, marker.y * cv.height - point.y) < 14);
+  const marker = existing ?? { id: manualMarkers.length, label: '', x: 0, y: 0, template: null, confidence: 1 };
+  marker.label = $('#manualMarkerLabel').value;
+  marker.x = point.x / cv.width; marker.y = point.y / cv.height;
+  marker.template = point.patch; marker.confidence = 1;
+  if (!existing) manualMarkers.push(marker);
+  renderManualMarkerCount();
+  e.preventDefault();
+});
 
 // ---------- 메인 루프 ----------
 if (HAS_RVFC) {
@@ -681,18 +805,21 @@ async function loop() {
 
             // match to tracked persons (use Kalman predicted centers when available)
             const newTracked = [];
+            const matchedIds = new Set();
             const preds = trackedPersons.map(p => {
               const pc = p.kbox ? p.kbox.predict() : { x: p.bbox.x1 + p.bbox.w/2, y: p.bbox.y1 + p.bbox.h/2 };
-              return { p, pc };
+              return { p, pc, bbox: { ...p.bbox } };
             });
             for (const b of boxes) {
               let matched = null, best = 0;
-              for (const { p, pc } of preds) {
-                const predBox = { x1: pc.x - p.bbox.w/2, y1: pc.y - p.bbox.h/2, w: p.bbox.w, h: p.bbox.h };
+              for (const { p, pc, bbox } of preds) {
+                if (matchedIds.has(p.id)) continue;
+                const predBox = { x1: pc.x - bbox.w/2, y1: pc.y - bbox.h/2, w: bbox.w, h: bbox.h };
                 const s = iou(predBox, b);
                 if (s > best) { best = s; matched = p; }
               }
               if (matched && best >= IOU_MATCH) {
+                matchedIds.add(matched.id);
                 matched.bbox = b; matched.lastSeen = now;
                 // update Kalman with new center measurement
                 try {
@@ -704,6 +831,9 @@ async function loop() {
                 const centerX = b.x1 + b.w/2, centerY = b.y1 + b.h/2;
                 newTracked.push({ id, bbox: b, lastPose: null, lastPoseTs: 0, lastSeen: now, kbox: new SimpleKalmanBox(centerX, centerY) });
               }
+            }
+            for (const p of trackedPersons) {
+              if (!matchedIds.has(p.id) && now - p.lastSeen <= TRACK_HOLD_MS) newTracked.push(p);
             }
             trackedPersons = newTracked;
 
@@ -759,6 +889,7 @@ async function loop() {
     inferBusy = false;
     frameReady = false; forceDetect = false; lastDetectT = t;
   }
+  updateManualMarkers(now);
   draw();
 
   // 타임라인/시간 표시
@@ -793,11 +924,20 @@ $('#snapBtn').addEventListener('click', () => {
 });
 
 function seekAsync(t) {
-  return new Promise((resolve) => {
-    const done = () => { video.removeEventListener('seeked', done); resolve(); };
-    video.addEventListener('seeked', done);
-    video.currentTime = t;
-  });
+                    const final = lm.map((pnt, index) => {
+                      const current = {
+                        x: (pnt.x * cw + x1) / video.videoWidth,
+                        y: (pnt.y * ch + y1) / video.videoHeight,
+                        visibility: pnt.visibility,
+                      };
+                      const previous = p.lastPose?.[index];
+                      if ((current.visibility ?? 1) < 0.35 || !previous) return current;
+                      return {
+                        ...current,
+                        x: previous.x * POSE_SMOOTHING + current.x * (1 - POSE_SMOOTHING),
+                        y: previous.y * POSE_SMOOTHING + current.y * (1 - POSE_SMOOTHING),
+                      };
+                    });
 }
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 

@@ -13,14 +13,12 @@
 1. 이 폴더의 **모든 파일**(숨김 파일 `.nojekyll` 포함)을 GitHub 저장소에 올립니다.
    - `git push`로 올리면 그대로 됩니다. (파일당 100MB 미만이라 Git LFS는 필요 없습니다.)
    - GitHub 웹 화면에서 끌어다 놓는 방식은 **파일당 25MB 제한**이 있어 대형 모델은 업로드에 제약이 있습니다.
-    이 저장소는 GitHub 업로드 제한을 고려해 `pose_landmarker_heavy.task`를 기본으로 포함하지 않습니다.
-    필요하면 직접 내려받아 `models/`에 넣으세요.
+    현재 작업 폴더에는 `pose_landmarker_heavy.task`도 포함되어 있습니다. 이 파일은 25MB를 넘으므로 GitHub 웹 업로드 대신 `git push`로 올리세요.
 2. 저장소 **Settings → Pages → Build and deployment**에서 Source를 `Deploy from a branch`,
    Branch를 `main` / `/ (root)`로 지정하고 저장합니다.
 3. 1~2분 뒤 `https://<계정>.github.io/<저장소>/` 로 접속합니다.
 
-> 이 저장소는 업로드 한도를 고려해 `pose_landmarker_heavy.task`를 기본적으로 포함하지 않습니다.
-> 필요하면 공식 배포처에서 모델을 내려받아 `models/`에 추가하세요.
+> Heavy 모델 파일은 약 30MB입니다. GitHub 웹 업로드 제한(25MB)을 넘으므로 Git을 통해 올려야 GitHub Pages에서도 Heavy 모델을 사용할 수 있습니다.
 
 ## 내 PC에서 먼저 확인하기
 
