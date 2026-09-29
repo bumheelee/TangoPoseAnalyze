@@ -82,6 +82,7 @@
 <header>
   <h1>동영상 관절 스켈레톤</h1>
   <span>영상은 서버로 업로드되지 않고 이 브라우저 안에서만 처리됩니다.</span>
+  <img id="logoImg" src="maximo_tango_b.png" alt="logo" style="height:36px;margin-left:12px;object-fit:contain" onerror="this.style.display='none'">
 </header>
 
 <main>
@@ -200,6 +201,10 @@ const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
 // ---------- 상수 ----------
 const MAXDIM = 1280;                                 // 캔버스 최대 변 길이(성능/녹화 용량)
+// HTML-side performance tuning
+const DETECT_INTERVAL_MS = 150;                      // run pose detection at most once per this many ms
+const DETECT_MAX_SIDE = 960;                         // downscale video to this side for detection
+const POSE_MAX_SIDE = 512;                           // downscale per-person crop for pose inference
 const COLORS = ['#22d3ee', '#4ade80', '#fb923c', '#e879f9', '#60a5fa', '#facc15'];
 // MediaPipe Pose 33점 연결
 const CONN = [
@@ -218,6 +223,7 @@ let result = null, frameReady = false, forceDetect = false, lastDetectT = -1, la
 let a = null, b = null;
 let fps = 30, prevMT = null, minD = Infinity;
 let inferMs = 0, dragging = false;
+let lastInferAt = 0;
 const rec = { active: false, recorder: null, chunks: [], start: 0, end: 0, mime: '' };
 
 const opts = {
@@ -483,12 +489,40 @@ function loop() {
 
   const t = video.currentTime;
   const isNew = HAS_RVFC ? frameReady : (t !== lastDetectT);
-  if ((isNew || forceDetect) && !video.seeking && landmarker) {
+  const now = performance.now();
+  const canDetect = (now - lastInferAt) >= DETECT_INTERVAL_MS || forceDetect;
+  if ((isNew || forceDetect) && !video.seeking && landmarker && canDetect) {
     lastTs = Math.max(lastTs + 1, performance.now());     // VIDEO 모드는 단조 증가 타임스탬프가 필요
     const t0 = performance.now();
-    try { result = landmarker.detectForVideo(video, lastTs); }
-    catch (e) { console.warn('detect 실패', e); }
+    try {
+      // Try faster path: create a small ImageBitmap and run image detection if supported by API
+      let detected = false;
+      try {
+        // prepare downscaled canvas
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(vw || 1, vh || 1));
+        if (scale < 1) {
+          const dw = Math.round(vw * scale), dh = Math.round(vh * scale);
+          const tmp = document.createElement('canvas'); tmp.width = dw; tmp.height = dh;
+          const tctx = tmp.getContext('2d'); tctx.drawImage(video, 0, 0, dw, dh);
+          const ib = await createImageBitmap(tmp);
+          if (landmarker.detect) {
+            const r = landmarker.detect(ib);
+            if (r) { result = r; detected = true; }
+          }
+          ib.close();
+        }
+      } catch (err) {
+        // gracefully fallback to detectForVideo
+        console.debug('fast detect path failed, falling back', err);
+      }
+      if (!detected) {
+        try { result = landmarker.detectForVideo(video, lastTs); }
+        catch (e) { console.warn('detect 실패', e); }
+      }
+    } catch (e) { console.warn('detect 실패', e); }
     inferMs = inferMs * 0.8 + (performance.now() - t0) * 0.2;
+    lastInferAt = performance.now();
     frameReady = false; forceDetect = false; lastDetectT = t;
   }
   draw();
